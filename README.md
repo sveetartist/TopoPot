@@ -5,7 +5,7 @@ Minimal retopology add-on for Blender 5.0.
 ## Install
 
 In Blender, open Edit > Preferences > Add-ons, use the menu's Install from Disk,
-and select `zips/retopo_pool-1.5.0.zip`. Enable Retopo Pool. Restart Blender after
+and select `zips/retopo_pool-1.6.0.zip`. Enable Retopo Pool. Restart Blender after
 updating an already enabled older version.
 
 ## Use
@@ -55,6 +55,10 @@ supports bridging. Connections that cannot form a face path are rejected before 
 the mesh; use intermediate edge clicks to define a path in complex topology.
 
 Left-click selects a vertex or edge; drag a vertex to move it on the surface.
+Left-drag the middle of an edge to move both endpoints together. Endpoints snap
+to Reference when set; without Reference the edge translates in the view plane.
+Release to confirm, or Esc/right-click to restore both endpoints. Edge dragging
+does not auto-merge vertices. Ctrl-drag on an edge remains the loop-cut gesture.
 Dragging within Merge Radius of another visible vertex snaps to that vertex and
 highlights it in amber. Release to weld the dragged vertex into the target,
 preserving the target position and joining the topology. Esc/right-click restores

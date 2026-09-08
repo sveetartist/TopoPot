@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Retopo Pool",
     "author": "Retopo Pool",
-    "version": (1, 5, 0),
+    "version": (1, 6, 0),
     "blender": (5, 0, 0),
     "location": "3D View > Sidebar > Retopo",
     "description": "Minimal surface retopology with progressive triangles and quads",
@@ -129,6 +129,16 @@ def edge_parameter(context, edge, mouse):
     return factor * wa / denominator if abs(denominator) > 1e-10 else factor
 
 
+def edge_drag_positions(context, originals, start, mouse, snap=None):
+    matrix = context.edit_object.matrix_world
+    depth = matrix @ ((originals[0] + originals[1]) / 2)
+    origin = view3d_utils.region_2d_to_location_3d(context.region, context.region_data, start, depth)
+    destination = view3d_utils.region_2d_to_location_3d(context.region, context.region_data, mouse, depth)
+    delta = matrix.inverted_safe().to_3x3() @ (destination - origin)
+    positions = [co + delta for co in originals]
+    return [snap(co) for co in positions] if snap is not None else positions
+
+
 def preview(bm, anchor, hit, point, edge_factor=0.5, bridge_mode=False, with_kind=False, strict=False):
     """Run the actual operation on a disposable mesh so preview and commit agree."""
     copy = bm.copy()
@@ -219,6 +229,17 @@ class RP_OT_click(bpy.types.Operator):
             sync(obj)
             return {'FINISHED'}
         topology.select(bm, hit)
+        if isinstance(hit, bmesh.types.BMEdge):
+            bm.verts.index_update()
+            self.move_indices = [v.index for v in hit.verts]
+            self.move_originals = [v.co.copy() for v in hit.verts]
+            self.obj, self.area, self.region = obj, context.area, context.region
+            self.start = mouse
+            self.dragging = False
+            self.move_edge = True
+            sync(obj, destructive=False)
+            context.window_manager.modal_handler_add(self)
+            return {'RUNNING_MODAL'}
         if isinstance(hit, bmesh.types.BMVert):
             bm.verts.index_update()
             self.obj = obj
@@ -236,6 +257,8 @@ class RP_OT_click(bpy.types.Operator):
 
     def modal(self, context, event):
         global _merge_target
+        if getattr(self, 'move_edge', False):
+            return RP_OT_click.modal_move_edge(self, context, event)
         if getattr(self, 'connect_gesture', False):
             return RP_OT_click.modal_connect(self, context, event)
         if getattr(self, 'edge_gesture', False):
@@ -282,6 +305,40 @@ class RP_OT_click(bpy.types.Operator):
                     sync(obj, destructive=False)
             context.area.tag_redraw()
         return {'RUNNING_MODAL'}
+
+    def modal_move_edge(self, context, event):
+        if context.mode != 'EDIT_MESH' or context.edit_object != self.obj:
+            return {'CANCELLED'}
+        bm = bmesh.from_edit_mesh(self.obj.data)
+        bm.verts.ensure_lookup_table()
+        if any(i >= len(bm.verts) for i in self.move_indices):
+            return {'CANCELLED'}
+        verts = [bm.verts[i] for i in self.move_indices]
+        if event.type in {'ESC', 'RIGHTMOUSE'}:
+            for vert, original in zip(verts, self.move_originals):
+                vert.co = original
+            sync(self.obj, destructive=False)
+            self.area.tag_redraw()
+            return {'FINISHED'}
+        release = event.type == 'LEFTMOUSE' and event.value == 'RELEASE'
+        if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'} or release:
+            mouse = Vector((event.mouse_x - self.region.x, event.mouse_y - self.region.y))
+            self.dragging |= (mouse - self.start).length > 3
+            if self.dragging:
+                try:
+                    with context.temp_override(area=self.area, region=self.region):
+                        track_mouse(context, event)
+                        if not hasattr(self, 'move_snap'):
+                            self.move_snap = reference_projector(context)
+                        positions = edge_drag_positions(context, self.move_originals, self.start, mouse, self.move_snap)
+                    for vert, position in zip(verts, positions):
+                        vert.co = position
+                    sync(self.obj, destructive=False)
+                except ValueError as error:
+                    if release:
+                        self.report({'WARNING'}, str(error))
+            self.area.tag_redraw()
+        return {'FINISHED'} if release else {'RUNNING_MODAL'}
 
     def modal_edge(self, context, event):
         global _loop_preview
