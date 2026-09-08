@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Retopo Pool",
     "author": "Retopo Pool",
-    "version": (1, 2, 1),
+    "version": (1, 3, 0),
     "blender": (5, 0, 0),
     "location": "3D View > Sidebar > Retopo",
     "description": "Minimal surface retopology with progressive triangles and quads",
@@ -151,6 +151,15 @@ class RP_OT_click(bpy.types.Operator):
         mouse = Vector((event.mouse_region_x, event.mouse_region_y))
         hit = pick(context, bm, mouse)
         anchor = topology.active(bm)
+        if event.ctrl and not event.shift and isinstance(hit, bmesh.types.BMEdge):
+            bm.edges.index_update()
+            self.edge_index = hit.index
+            self.obj, self.area, self.region = obj, context.area, context.region
+            self.start = mouse
+            self.dragging = False
+            self.edge_gesture = True
+            context.window_manager.modal_handler_add(self)
+            return {'RUNNING_MODAL'}
         if event.ctrl:
             try:
                 point = placement(context, mouse, anchor) if hit is None else None
@@ -188,6 +197,8 @@ class RP_OT_click(bpy.types.Operator):
         return {'FINISHED'}
 
     def modal(self, context, event):
+        if getattr(self, 'edge_gesture', False):
+            return RP_OT_click.modal_edge(self, context, event)
         if context.mode != 'EDIT_MESH' or context.edit_object != self.obj:
             return {'CANCELLED'}
         bm = bmesh.from_edit_mesh(self.obj.data)
@@ -215,8 +226,52 @@ class RP_OT_click(bpy.types.Operator):
             context.area.tag_redraw()
         return {'RUNNING_MODAL'}
 
+    def modal_edge(self, context, event):
+        global _loop_preview
+        if context.mode != 'EDIT_MESH' or context.edit_object != self.obj:
+            _loop_preview = None
+            return {'CANCELLED'}
+        if event.type in {'ESC', 'RIGHTMOUSE'}:
+            _loop_preview = None
+            self.area.tag_redraw()
+            return {'CANCELLED'}
+        bm = bmesh.from_edit_mesh(self.obj.data)
+        bm.edges.ensure_lookup_table()
+        edge = bm.edges[self.edge_index]
+        mouse = Vector((event.mouse_x - self.region.x, event.mouse_y - self.region.y))
+        self.dragging |= (mouse - self.start).length > 4
+        with context.temp_override(area=self.area, region=self.region):
+            track_mouse(context, event)
+            factor = edge_parameter(context, edge, mouse if self.dragging else self.start)
+        release = event.type == 'LEFTMOUSE' and event.value == 'RELEASE'
+        try:
+            if self.dragging:
+                coords = topology.loop_preview(edge, factor)
+                _loop_preview = (self.region.as_pointer(), coords)
+                if release:
+                    topology.loop_cut(bm, edge, factor)
+            elif release:
+                anchor = topology.active(bm)
+                preview(bm, anchor, edge, None, factor, strict=True)
+                topology.apply_click(bm, anchor, edge, edge_factor=factor)
+            if release:
+                sync(self.obj)
+        except ValueError as error:
+            _loop_preview = (self.region.as_pointer(), [])
+            if release:
+                self.report({'WARNING'}, str(error))
+                _loop_preview = None
+                self.area.tag_redraw()
+                return {'CANCELLED'}
+        self.area.tag_redraw()
+        if release:
+            _loop_preview = None
+            return {'FINISHED'}
+        return {'RUNNING_MODAL'}
+
 
 _mouse_region = None
+_loop_preview = None
 
 
 def track_mouse(context, event):
@@ -346,7 +401,9 @@ def draw_hover():
     matrix = context.edit_object.matrix_world
     polygons = []
     kind = 'POINTS'
-    if context.window_manager.retopo_pool_ctrl:
+    if _loop_preview is not None and _loop_preview[0] == context.region.as_pointer():
+        kind, polygons = 'LINES', _loop_preview[1]
+    elif context.window_manager.retopo_pool_ctrl:
         anchor = topology.active(bm)
         point = placement(context, mouse, anchor) if hit is None else None
         factor = edge_parameter(context, hit, mouse) if isinstance(hit, bmesh.types.BMEdge) else 0.5

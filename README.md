@@ -5,7 +5,7 @@ Minimal retopology add-on for Blender 5.0.
 ## Install
 
 In Blender, open Edit > Preferences > Add-ons, use the menu's Install from Disk,
-and select `retopo_pool-1.2.1.zip`. Enable Retopo Pool. Restart Blender after
+and select `zips/retopo_pool-1.3.0.zip`. Enable Retopo Pool. Restart Blender after
 updating an already enabled older version.
 
 ## Use
@@ -26,6 +26,12 @@ updating an already enabled older version.
    Finish or commit a pending triangle before bridging.
 
 ## Cuts and Subdivision
+
+- Ctrl-left-drag an edge to preview a loop cut through its connected quad strip.
+  Drag along the starting edge to slide the cut, then release to confirm.
+  Esc or right-click cancels without changing the mesh. The cut stops at
+  boundaries, non-quad faces, hidden geometry, and non-manifold edges.
+- A Ctrl-click without dragging still subdivides only the clicked edge on release.
 
 - Ctrl-click an edge to insert a vertex at the cursor position. Adjacent faces
   retain their surface and gain the inserted corner.
