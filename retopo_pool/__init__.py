@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Retopo Pool",
     "author": "Retopo Pool",
-    "version": (1, 6, 0),
+    "version": (1, 8, 0),
     "blender": (5, 0, 0),
     "location": "3D View > Sidebar > Retopo",
     "description": "Minimal surface retopology with progressive triangles and quads",
@@ -32,6 +32,7 @@ class RP_Settings(bpy.types.PropertyGroup):
     offset: FloatProperty(name="Offset", default=0.001, min=0, soft_max=0.1, subtype='DISTANCE')
     radius: IntProperty(name="Pick Radius", default=14, min=4, max=48, subtype='PIXEL')
     merge_radius: IntProperty(name="Merge Radius", description="Snap and merge a dragged vertex within this screen distance", default=10, min=3, max=32, subtype='PIXEL')
+    reference_tolerance: IntProperty(name="Reference Tolerance", description="Allow selection slightly below Reference, using this many screen pixels as a depth allowance; zero uses strict occlusion", default=12, min=0, max=64, subtype='PIXEL')
 
 
 def project(context, mouse, depth):
@@ -47,13 +48,103 @@ def project(context, mouse, depth):
         hit, location, normal, _ = evaluated.ray_cast(inverse @ origin, (inverse.to_3x3() @ direction).normalized())
         if hit:
             normal = (inverse.transposed().to_3x3() @ normal).normalized()
+            if normal.dot(direction) >= -1e-6:
+                return None
             return matrix @ location + normal * settings.offset
         return None
     return view3d_utils.region_2d_to_location_3d(region, rv3d, mouse, depth)
 
 
+_visibility_cache = {}
+
+
+def object_key(obj):
+    return obj.as_pointer() if hasattr(obj, 'as_pointer') else id(obj)
+
+
+def cached_tree(kind, obj, build, counts=()):
+    data = getattr(obj, 'data', None)
+    signature = (object_key(data), tuple(value for row in obj.matrix_world for value in row), counts)
+    key = (kind, object_key(obj))
+    entry = _visibility_cache.get(key)
+    if entry is None or entry[0] != signature:
+        entry = (signature, build())
+        _visibility_cache[key] = entry
+    return entry[1]
+
+
+@bpy.app.handlers.persistent
+def invalidate_visibility(scene=None, depsgraph=None):
+    if depsgraph is None:
+        _visibility_cache.clear()
+        return
+    changed = {object_key(update.id.original) for update in depsgraph.updates
+               if update.is_updated_geometry or update.is_updated_transform}
+    for key, (signature, _) in list(_visibility_cache.items()):
+        if key[1] in changed or signature[0] in changed:
+            del _visibility_cache[key]
+
+
+def reference_tree(context):
+    reference = context.scene.retopo_pool.target
+    if reference is None or reference == context.edit_object:
+        return None
+    def build():
+        evaluated = reference.evaluated_get(context.evaluated_depsgraph_get())
+        mesh = evaluated.to_mesh()
+        try:
+            return BVHTree.FromPolygons([evaluated.matrix_world @ v.co for v in mesh.vertices],
+                                       [tuple(p.vertices) for p in mesh.polygons])
+        finally:
+            evaluated.to_mesh_clear()
+    return cached_tree('reference', reference, build)
+
+
+def visible_from_view(context, co, tree, tolerance=1e-5):
+    screen = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, co)
+    if screen is None:
+        return False
+    origin = view3d_utils.region_2d_to_origin_3d(context.region, context.region_data, screen)
+    direction = view3d_utils.region_2d_to_vector_3d(context.region, context.region_data, screen)
+    distance = (co - origin).dot(direction)
+    if distance <= 0:
+        return False
+    location, _, _, hit_distance = tree.ray_cast(origin, direction)
+    return location is None or hit_distance >= distance - tolerance
+
+
+def reference_pick_tolerance(context, co):
+    settings = context.scene.retopo_pool
+    tolerance = max(1e-5, settings.offset * 2)
+    pixels = getattr(settings, 'reference_tolerance', 12)
+    if pixels:
+        screen = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, co)
+        if screen is not None:
+            a = view3d_utils.region_2d_to_location_3d(context.region, context.region_data, screen, co)
+            b = view3d_utils.region_2d_to_location_3d(context.region, context.region_data, screen + Vector((pixels, 0)), co)
+            tolerance = max(tolerance, (b - a).length)
+    return tolerance
+
+
 def pick(context, bm, mouse, exclude=None, vertices_only=False, radius=None):
     matrix = context.edit_object.matrix_world
+    def build_edit_tree():
+        verts = list(bm.verts)
+        indices = {v: i for i, v in enumerate(verts)}
+        return BVHTree.FromPolygons([matrix @ v.co for v in verts],
+                                   [tuple(indices[v] for v in f.verts) for f in bm.faces if not f.hide])
+    trees = None
+
+    def visible(co):
+        nonlocal trees
+        if trees is None:
+            trees = (cached_tree('edit', context.edit_object, build_edit_tree,
+                                 (len(bm.verts), len(bm.edges), len(bm.faces))), reference_tree(context))
+        edit_tree, ref_tree = trees
+        return (visible_from_view(context, co, edit_tree) and
+                (ref_tree is None or visible_from_view(context, co, ref_tree,
+                 max(1e-5, context.scene.retopo_pool.offset * 2) if exclude is not None
+                 else reference_pick_tolerance(context, co))))
     coords = {}
     best_v, best_e = None, None
     vr = er = context.scene.retopo_pool.radius if radius is None else radius
@@ -64,7 +155,7 @@ def pick(context, bm, mouse, exclude=None, vertices_only=False, radius=None):
         if point is not None:
             coords[vert] = point
             distance = (point - mouse).length
-            if distance < vr:
+            if distance < vr and visible(matrix @ vert.co):
                 best_v, vr = vert, distance
     if vertices_only:
         return best_v
@@ -75,7 +166,7 @@ def pick(context, bm, mouse, exclude=None, vertices_only=False, radius=None):
         delta = b - a
         t = max(0, min(1, (mouse - a).dot(delta) / max(delta.length_squared, 1e-12)))
         distance = (mouse - (a + t * delta)).length
-        if distance < er:
+        if distance < er and visible(matrix @ edge.verts[0].co.lerp(edge.verts[1].co, t)):
             best_e, er = edge, distance
     return best_v if best_v is not None else best_e
 
@@ -96,14 +187,7 @@ def reference_projector(context):
     obj = context.edit_object
     if reference is None or reference == obj:
         return None
-    evaluated = reference.evaluated_get(context.evaluated_depsgraph_get())
-    mesh = evaluated.to_mesh()
-    try:
-        # World-space distances keep nearest-surface snapping correct under object scale.
-        tree = BVHTree.FromPolygons([evaluated.matrix_world @ v.co for v in mesh.vertices],
-                                    [tuple(p.vertices) for p in mesh.polygons])
-    finally:
-        evaluated.to_mesh_clear()
+    tree = reference_tree(context)
     matrix = obj.matrix_world.copy()
     inverse = matrix.inverted_safe()
     offset = context.scene.retopo_pool.offset
@@ -112,6 +196,12 @@ def reference_projector(context):
         location, normal, _, _ = tree.find_nearest(matrix @ co)
         if location is None:
             raise ValueError("Reference mesh has no surface to snap to")
+        screen = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, location)
+        if screen is None:
+            return co.copy()
+        direction = view3d_utils.region_2d_to_vector_3d(context.region, context.region_data, screen)
+        if normal.dot(direction) >= -1e-6 or not visible_from_view(context, location, tree):
+            return co.copy()
         return inverse @ (location + normal * offset)
     return snap
 
@@ -139,7 +229,7 @@ def edge_drag_positions(context, originals, start, mouse, snap=None):
     return [snap(co) for co in positions] if snap is not None else positions
 
 
-def preview(bm, anchor, hit, point, edge_factor=0.5, bridge_mode=False, with_kind=False, strict=False):
+def preview(bm, anchor, hit, point, edge_factor=0.5, bridge_mode=False, with_kind=False, strict=False, project=None):
     """Run the actual operation on a disposable mesh so preview and commit agree."""
     copy = bm.copy()
     try:
@@ -151,7 +241,7 @@ def preview(bm, anchor, hit, point, edge_factor=0.5, bridge_mode=False, with_kin
             return destination[list(source).index(element)]
 
         anchor, hit = mapped(anchor), mapped(hit)
-        result = topology.apply_click(copy, anchor, hit, point, edge_factor, bridge_mode)
+        result = topology.apply_click(copy, anchor, hit, point, edge_factor, bridge_mode, project)
         if isinstance(result, list):
             kind = 'LINES'
             coords = [v.co.copy() for edge in result for v in edge.verts]
@@ -169,6 +259,7 @@ def preview(bm, anchor, hit, point, edge_factor=0.5, bridge_mode=False, with_kin
 
 
 def sync(obj, destructive=True):
+    _visibility_cache.pop(('edit', object_key(obj)), None)
     bm = bmesh.from_edit_mesh(obj.data)
     bm.normal_update()
     bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=destructive)
@@ -214,8 +305,9 @@ class RP_OT_click(bpy.types.Operator):
                 point = obj.matrix_world.inverted_safe() @ point if point is not None else None
                 factor = edge_parameter(context, hit, mouse) if isinstance(hit, bmesh.types.BMEdge) else 0.5
                 # Validate on a copy before splitting any live edges.
-                preview(bm, anchor, hit, point, factor, event.shift, strict=True)
-                topology.apply_click(bm, anchor, hit, point, factor, event.shift)
+                snap = reference_projector(context)
+                preview(bm, anchor, hit, point, factor, event.shift, strict=True, project=snap)
+                topology.apply_click(bm, anchor, hit, point, factor, event.shift, project=snap)
                 sync(obj)
             except ValueError as error:
                 self.report({'WARNING'}, str(error))
@@ -368,8 +460,9 @@ class RP_OT_click(bpy.types.Operator):
                     topology.loop_cut(bm, edge, factor, self.loop_projector)
             elif release:
                 anchor = topology.active(bm)
-                preview(bm, anchor, edge, None, factor, strict=True)
-                topology.apply_click(bm, anchor, edge, edge_factor=factor)
+                snap = reference_projector(context)
+                preview(bm, anchor, edge, None, factor, strict=True, project=snap)
+                topology.apply_click(bm, anchor, edge, edge_factor=factor, project=snap)
             if release:
                 sync(self.obj)
         except ValueError as error:
@@ -404,11 +497,12 @@ class RP_OT_click(bpy.types.Operator):
             if self.dragging and not isinstance(hit, bmesh.types.BMVert):
                 raise ValueError("Release over a vertex to connect")
             anchor = start if self.dragging else topology.active(bm)
-            kind, coords = preview(bm, anchor, hit, None, with_kind=True, strict=True)
+            snap = reference_projector(context)
+            kind, coords = preview(bm, anchor, hit, None, with_kind=True, strict=True, project=snap)
             if self.dragging:
                 _loop_preview = (self.region.as_pointer(), coords if kind == 'LINES' else [])
             if release:
-                topology.apply_click(bm, anchor, hit)
+                topology.apply_click(bm, anchor, hit, project=snap)
                 sync(self.obj)
         except ValueError as error:
             _loop_preview = (self.region.as_pointer(), [])
@@ -535,6 +629,7 @@ class RP_PT_panel(bpy.types.Panel):
         layout.prop(settings, "offset")
         layout.prop(settings, "radius")
         layout.prop(settings, "merge_radius")
+        layout.prop(settings, "reference_tolerance")
         layout.prop(context.space_data.overlay, "show_retopology", text="Retopology View")
         if context.space_data.overlay.show_retopology:
             layout.prop(context.space_data.overlay, "retopology_offset", text="View Offset")
@@ -564,7 +659,8 @@ def draw_hover():
         point = placement(context, mouse, anchor) if hit is None else None
         factor = edge_parameter(context, hit, mouse) if isinstance(hit, bmesh.types.BMEdge) else 0.5
         kind, polygons = preview(bm, anchor, hit, matrix.inverted_safe() @ point if point is not None else None,
-                                 factor, context.window_manager.retopo_pool_shift, with_kind=True)
+                                 factor, context.window_manager.retopo_pool_shift, with_kind=True,
+                                 project=reference_projector(context))
 
     def screen(coords):
         result = [view3d_utils.location_3d_to_region_2d(context.region, context.region_data, matrix @ co) for co in coords]
@@ -606,6 +702,11 @@ _draw_handle = None
 
 def register():
     global _draw_handle
+    invalidate_visibility()
+    bpy.app.handlers.depsgraph_update_post.append(invalidate_visibility)
+    bpy.app.handlers.undo_post.append(invalidate_visibility)
+    bpy.app.handlers.redo_post.append(invalidate_visibility)
+    bpy.app.handlers.load_post.append(invalidate_visibility)
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.retopo_pool = PointerProperty(type=RP_Settings)
@@ -618,6 +719,11 @@ def register():
 
 def unregister():
     global _draw_handle
+    for handlers in (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.undo_post,
+                     bpy.app.handlers.redo_post, bpy.app.handlers.load_post):
+        if invalidate_visibility in handlers:
+            handlers.remove(invalidate_visibility)
+    invalidate_visibility()
     if _draw_handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
         _draw_handle = None

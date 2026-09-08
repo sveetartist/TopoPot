@@ -172,7 +172,17 @@ def connect_cut(bm, start, end):
     return result
 
 
-def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False):
+def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, project=None):
+    original = set(bm.verts) if project is not None else None
+    result = _apply_click(bm, anchor, hit, point, edge_factor, bridge_mode)
+    if project is not None:
+        positions = [(v, project(v.co)) for v in bm.verts if v not in original]
+        for vertex, position in positions:
+            vertex.co = position
+    return result
+
+
+def _apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False):
     if isinstance(hit, bmesh.types.BMEdge):
         if bridge_mode or (isinstance(anchor, bmesh.types.BMEdge) and anchor != hit):
             if not isinstance(anchor, bmesh.types.BMEdge):
