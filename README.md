@@ -5,7 +5,7 @@ Minimal retopology add-on for Blender 5.0.
 ## Install
 
 In Blender, open Edit > Preferences > Add-ons, use the menu's Install from Disk,
-and select `retopo_pool-1.2.0.zip`. Enable Retopo Pool. Restart Blender after
+and select `retopo_pool-1.2.1.zip`. Enable Retopo Pool. Restart Blender after
 updating an already enabled older version.
 
 ## Use

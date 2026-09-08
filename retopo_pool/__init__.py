@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Retopo Pool",
     "author": "Retopo Pool",
-    "version": (1, 2, 0),
+    "version": (1, 2, 1),
     "blender": (5, 0, 0),
     "location": "3D View > Sidebar > Retopo",
     "description": "Minimal surface retopology with progressive triangles and quads",
@@ -11,11 +11,15 @@ bl_info = {
 import bpy
 import bmesh
 import gpu
+import importlib
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 from bpy.props import PointerProperty, FloatProperty, IntProperty
 from . import topology
+
+# Blender can reload the package after installation while retaining its submodules.
+topology = importlib.reload(topology)
 
 
 def mesh_filter(self, obj):

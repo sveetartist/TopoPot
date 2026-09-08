@@ -3,7 +3,7 @@ from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 
 root = Path(__file__).resolve().parent
-destination = root / "retopo_pool-1.2.0.zip"
+destination = root / "retopo_pool-1.2.1.zip"
 with ZipFile(destination, "w", ZIP_DEFLATED) as archive:
     for path in sorted((root / "retopo_pool").glob("*.py")):
         archive.write(path, path.relative_to(root))
