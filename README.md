@@ -5,7 +5,7 @@ Minimal retopology add-on for Blender 5.0.
 ## Install
 
 In Blender, open Edit > Preferences > Add-ons, use the menu's Install from Disk,
-and select `zips/retopo_pool-1.3.0.zip`. Enable Retopo Pool. Restart Blender after
+and select `zips/retopo_pool-1.4.0.zip`. Enable Retopo Pool. Restart Blender after
 updating an already enabled older version.
 
 ## Use
@@ -28,6 +28,9 @@ updating an already enabled older version.
 ## Cuts and Subdivision
 
 - Ctrl-left-drag an edge to preview a loop cut through its connected quad strip.
+  New loop vertices snap to the nearest evaluated Reference surface with Offset;
+  the preview uses the same snapped positions. Without Reference they stay on
+  the edited edges. Existing vertices are not moved.
   Drag along the starting edge to slide the cut, then release to confirm.
   Esc or right-click cancels without changing the mesh. The cut stops at
   boundaries, non-quad faces, hidden geometry, and non-manifold edges.
@@ -37,6 +40,9 @@ updating an already enabled older version.
   retain their surface and gain the inserted corner.
 - Ctrl-click another edge to split it and connect from the previous cut point.
 - Select a vertex, then Ctrl-click another vertex or edge to cut between them.
+- Ctrl-drag from one vertex to another also connects them, splitting the shared
+  n-gon or a supported face path. Release over the destination vertex to commit;
+  Esc or right-click cancels. Adjacent vertices reuse their existing edge.
 - Cuts split existing faces, including a path across multiple faces where
   Blender can resolve it. The last point stays selected for continued cutting.
 - Click empty space without Ctrl to clear the cut starting point. Ctrl-click

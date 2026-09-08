@@ -181,14 +181,18 @@ def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False)
             return connect_cut(bm, anchor, vertex)
         select(bm, vertex)
         return vertex
-    if isinstance(hit, bmesh.types.BMVert) and isinstance(anchor, bmesh.types.BMVert) and not pending(bm):
+    if isinstance(hit, bmesh.types.BMVert) and isinstance(anchor, bmesh.types.BMVert):
         return connect_cut(bm, anchor, hit)
+    if isinstance(hit, bmesh.types.BMVert) and isinstance(anchor, bmesh.types.BMEdge) and hit in anchor.verts:
+        clear_pending(bm)
+        select(bm, hit)
+        return hit
     if hit is None and point is None:
         raise ValueError("Cursor is outside the reference surface")
     return extend(bm, anchor, hit if hit is not None else bm.verts.new(point))
 
 
-def loop_plan(edge, factor):
+def loop_plan(edge, factor, project=None):
     if edge.hide or len(edge.link_faces) > 2:
         raise ValueError("Choose an edge in a manifold quad strip")
     factor = max(0.001, min(0.999, factor))
@@ -214,16 +218,18 @@ def loop_plan(edge, factor):
     if not faces:
         raise ValueError("Loop cuts need a connected quad face")
     points = {e: v.co.lerp(e.other_vert(v).co, factor) for e, v in starts.items()}
+    if project is not None:
+        points = {e: project(co) for e, co in points.items()}
     return starts, faces, points
 
 
-def loop_preview(edge, factor):
-    _, faces, points = loop_plan(edge, factor)
+def loop_preview(edge, factor, project=None):
+    _, faces, points = loop_plan(edge, factor, project)
     return [points[e].copy() for pair in faces.values() for e in pair]
 
 
-def loop_cut(bm, edge, factor):
-    starts, faces, _ = loop_plan(edge, factor)
+def loop_cut(bm, edge, factor, project=None):
+    starts, faces, points = loop_plan(edge, factor, project)
     clear_pending(bm)
     vertices = {e: bmesh.utils.edge_split(e, start, max(0.001, min(0.999, factor)))[1]
                 for e, start in starts.items()}
@@ -231,6 +237,8 @@ def loop_cut(bm, edge, factor):
     for face, (a, b) in faces.items():
         _, loop = bmesh.utils.face_split(face, vertices[a], vertices[b])
         cuts.append(loop.edge)
+    for original_edge, vertex in vertices.items():
+        vertex.co = points[original_edge]
     select(bm, None)
     for cut in cuts:
         cut.select_set(True)
