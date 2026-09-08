@@ -5,7 +5,7 @@ Minimal retopology add-on for Blender 5.0.
 ## Install
 
 In Blender, open Edit > Preferences > Add-ons, use the menu's Install from Disk,
-and select `zips/retopo_pool-1.4.0.zip`. Enable Retopo Pool. Restart Blender after
+and select `zips/retopo_pool-1.5.0.zip`. Enable Retopo Pool. Restart Blender after
 updating an already enabled older version.
 
 ## Use
@@ -21,9 +21,10 @@ updating an already enabled older version.
    outer edge becomes selected, ready for the next triangle/quad pair.
 4. To keep a triangle, left-click its next starting edge. A plain selection
    commits the triangle and resets the pending quad.
-5. Ctrl-Shift-click another boundary edge to bridge it to the selected edge. Edges
+5. Ctrl-click another boundary edge to bridge it to the selected edge. Two
+   selected vertices joined by an edge also count as the starting edge. Edges
    with a shared endpoint form a triangle; separate edges form a quad.
-   Finish or commit a pending triangle before bridging.
+  Finish or commit a pending triangle before bridging.
 
 ## Cuts and Subdivision
 
@@ -34,7 +35,8 @@ updating an already enabled older version.
   Drag along the starting edge to slide the cut, then release to confirm.
   Esc or right-click cancels without changing the mesh. The cut stops at
   boundaries, non-quad faces, hidden geometry, and non-manifold edges.
-- A Ctrl-click without dragging still subdivides only the clicked edge on release.
+- A Ctrl-click without dragging subdivides the clicked edge on release unless
+  a different edge is selected, in which case it bridges. Ctrl-drag still cuts a loop.
 
 - Ctrl-click an edge to insert a vertex at the cursor position. Adjacent faces
   retain their surface and gain the inserted corner.
@@ -48,11 +50,17 @@ updating an already enabled older version.
 - Click empty space without Ctrl to clear the cut starting point. Ctrl-click
   an edge after that to subdivide it without connecting to an earlier point.
 
-Hold Ctrl for the insertion-point or cut-line preview. Ctrl-Shift previews
-bridges. Connections that cannot form a face path are rejected before editing
+Hold Ctrl for the insertion-point, cut-line, or bridge preview. Ctrl-Shift also
+supports bridging. Connections that cannot form a face path are rejected before editing
 the mesh; use intermediate edge clicks to define a path in complex topology.
 
 Left-click selects a vertex or edge; drag a vertex to move it on the surface.
+Dragging within Merge Radius of another visible vertex snaps to that vertex and
+highlights it in amber. Release to weld the dragged vertex into the target,
+preserving the target position and joining the topology. Esc/right-click restores
+the starting position without merging. Move away from the target before releasing
+to continue an ordinary drag. Merge Radius is measured in screen pixels; picking
+includes back-side vertices, so use a clear viewing angle when vertices overlap.
 Hold Ctrl to see a translucent polygon and outline before clicking. The preview
 includes triangle-to-quad conversion and edge bridges; invalid faces show no fill.
 Shift-click toggles selection. Vertices take pick priority near endpoints;

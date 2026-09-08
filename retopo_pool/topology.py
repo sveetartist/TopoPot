@@ -36,6 +36,11 @@ def select(bm, element):
 
 
 def active(bm):
+    verts = [vert for vert in bm.verts if vert.select and not vert.hide]
+    if len(verts) == 2:
+        edge = bm.edges.get(verts)
+        if edge is not None and not edge.hide:
+            return edge
     item = bm.select_history.active
     if isinstance(item, (bmesh.types.BMVert, bmesh.types.BMEdge)) and item.select:
         return item
@@ -169,7 +174,7 @@ def connect_cut(bm, start, end):
 
 def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False):
     if isinstance(hit, bmesh.types.BMEdge):
-        if bridge_mode:
+        if bridge_mode or (isinstance(anchor, bmesh.types.BMEdge) and anchor != hit):
             if not isinstance(anchor, bmesh.types.BMEdge):
                 raise ValueError("Select a starting edge to bridge")
             if pending(bm):
@@ -190,6 +195,14 @@ def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False)
     if hit is None and point is None:
         raise ValueError("Cursor is outside the reference surface")
     return extend(bm, anchor, hit if hit is not None else bm.verts.new(point))
+
+
+def merge_vertices(bm, source, target):
+    if source != target:
+        clear_pending(bm)
+        bmesh.ops.weld_verts(bm, targetmap={source: target})
+    select(bm, target)
+    return target
 
 
 def loop_plan(edge, factor, project=None):

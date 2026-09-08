@@ -3,7 +3,7 @@ from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 
 root = Path(__file__).resolve().parent
-destination = root / "zips" / "retopo_pool-1.4.0.zip"
+destination = root / "zips" / "retopo_pool-1.5.0.zip"
 destination.parent.mkdir(parents=True, exist_ok=True)
 with ZipFile(destination, "w", ZIP_DEFLATED) as archive:
     for path in sorted((root / "retopo_pool").glob("*.py")):

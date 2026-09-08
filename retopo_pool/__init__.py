@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Retopo Pool",
     "author": "Retopo Pool",
-    "version": (1, 4, 0),
+    "version": (1, 5, 0),
     "blender": (5, 0, 0),
     "location": "3D View > Sidebar > Retopo",
     "description": "Minimal surface retopology with progressive triangles and quads",
@@ -31,6 +31,7 @@ class RP_Settings(bpy.types.PropertyGroup):
     target: PointerProperty(name="Reference", description="Optional mesh used for surface projection", type=bpy.types.Object, poll=mesh_filter)
     offset: FloatProperty(name="Offset", default=0.001, min=0, soft_max=0.1, subtype='DISTANCE')
     radius: IntProperty(name="Pick Radius", default=14, min=4, max=48, subtype='PIXEL')
+    merge_radius: IntProperty(name="Merge Radius", description="Snap and merge a dragged vertex within this screen distance", default=10, min=3, max=32, subtype='PIXEL')
 
 
 def project(context, mouse, depth):
@@ -51,13 +52,13 @@ def project(context, mouse, depth):
     return view3d_utils.region_2d_to_location_3d(region, rv3d, mouse, depth)
 
 
-def pick(context, bm, mouse):
+def pick(context, bm, mouse, exclude=None, vertices_only=False, radius=None):
     matrix = context.edit_object.matrix_world
     coords = {}
     best_v, best_e = None, None
-    vr = er = context.scene.retopo_pool.radius
+    vr = er = context.scene.retopo_pool.radius if radius is None else radius
     for vert in bm.verts:
-        if vert.hide:
+        if vert.hide or vert == exclude:
             continue
         point = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, matrix @ vert.co)
         if point is not None:
@@ -65,6 +66,8 @@ def pick(context, bm, mouse):
             distance = (point - mouse).length
             if distance < vr:
                 best_v, vr = vert, distance
+    if vertices_only:
+        return best_v
     for edge in bm.edges:
         if edge.hide or any(v not in coords for v in edge.verts):
             continue
@@ -232,23 +235,37 @@ class RP_OT_click(bpy.types.Operator):
         return {'FINISHED'}
 
     def modal(self, context, event):
+        global _merge_target
         if getattr(self, 'connect_gesture', False):
             return RP_OT_click.modal_connect(self, context, event)
         if getattr(self, 'edge_gesture', False):
             return RP_OT_click.modal_edge(self, context, event)
         if context.mode != 'EDIT_MESH' or context.edit_object != self.obj:
+            _merge_target = None
             return {'CANCELLED'}
         bm = bmesh.from_edit_mesh(self.obj.data)
         bm.verts.ensure_lookup_table()
         if self.vertex_index >= len(bm.verts):
+            _merge_target = None
             return {'CANCELLED'}
         vertex = bm.verts[self.vertex_index]
         track_mouse(context, event)
         if event.type in {'ESC', 'RIGHTMOUSE'}:
+            _merge_target = None
             vertex.co = self.original
             sync(self.obj, destructive=False)
             return {'FINISHED'}
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            if self.dragging:
+                mouse = Vector((event.mouse_x - self.region.x, event.mouse_y - self.region.y))
+                with context.temp_override(area=self.area, region=self.region):
+                    target = pick(context, bm, mouse, exclude=vertex, vertices_only=True,
+                                  radius=context.scene.retopo_pool.merge_radius)
+                if target is not None:
+                    topology.merge_vertices(bm, vertex, target)
+                    sync(self.obj)
+            _merge_target = None
+            self.area.tag_redraw()
             return {'FINISHED'}
         if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
             mouse = Vector((event.mouse_x - self.region.x, event.mouse_y - self.region.y))
@@ -256,7 +273,10 @@ class RP_OT_click(bpy.types.Operator):
             if self.dragging:
                 obj = self.obj
                 with context.temp_override(area=self.area, region=self.region):
-                    point = project(context, mouse, obj.matrix_world @ self.original)
+                    target = pick(context, bm, mouse, exclude=vertex, vertices_only=True,
+                                  radius=context.scene.retopo_pool.merge_radius)
+                    point = obj.matrix_world @ target.co if target is not None else project(context, mouse, obj.matrix_world @ self.original)
+                _merge_target = (self.region.as_pointer(), target.co.copy()) if target is not None else None
                 if point is not None:
                     vertex.co = obj.matrix_world.inverted_safe() @ point
                     sync(obj, destructive=False)
@@ -349,6 +369,7 @@ class RP_OT_click(bpy.types.Operator):
 
 _mouse_region = None
 _loop_preview = None
+_merge_target = None
 
 
 def track_mouse(context, event):
@@ -456,6 +477,7 @@ class RP_PT_panel(bpy.types.Panel):
         layout.prop(settings, "target")
         layout.prop(settings, "offset")
         layout.prop(settings, "radius")
+        layout.prop(settings, "merge_radius")
         layout.prop(context.space_data.overlay, "show_retopology", text="Retopology View")
         if context.space_data.overlay.show_retopology:
             layout.prop(context.space_data.overlay, "retopology_offset", text="View Offset")
@@ -512,6 +534,9 @@ def draw_hover():
         if hit is not None:
             verts = [hit] if isinstance(hit, bmesh.types.BMVert) else hit.verts
             draw('POINTS' if len(verts) == 1 else 'LINES', screen([v.co for v in verts]), (0.15, 0.9, 0.65, 1.0))
+        if _merge_target is not None and _merge_target[0] == context.region.as_pointer():
+            gpu.state.point_size_set(13)
+            draw('POINTS', screen([_merge_target[1]]), (1.0, 0.65, 0.15, 1.0))
     finally:
         gpu.state.point_size_set(1)
         gpu.state.line_width_set(1)
