@@ -8,8 +8,12 @@ destination.parent.mkdir(parents=True, exist_ok=True)
 with ZipFile(destination, "w", ZIP_DEFLATED) as archive:
     for path in sorted((root / "retopo_pool").glob("*.py")):
         archive.write(path, path.relative_to(root))
+    for path in sorted((root / "retopo_pool" / "assets").glob("*")):
+        if path.is_file():
+            archive.write(path, path.relative_to(root))
     archive.write(root / "README.md", "retopo_pool/README.md")
 with ZipFile(destination) as archive:
     assert archive.testzip() is None
     assert "retopo_pool/__init__.py" in archive.namelist()
+    assert "retopo_pool/assets/retopo_icon.dat" in archive.namelist()
 print(destination)

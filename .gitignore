@@ -1,3 +1,6 @@
 zips/
 tests/
 retopo_pool/__pycache__/
+assets/
+!retopo_pool/assets/
+!retopo_pool/assets/*

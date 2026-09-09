@@ -12,6 +12,7 @@ import bpy
 import bmesh
 import gpu
 import importlib
+from pathlib import Path
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
@@ -21,6 +22,7 @@ from . import topology
 
 # Blender can reload the package after installation while retaining its submodules.
 topology = importlib.reload(topology)
+TOOL_ICON = str(Path(__file__).resolve().parent / "assets" / "retopo_icon")
 
 
 def mesh_filter(self, obj):
@@ -552,7 +554,7 @@ class RP_Tool(bpy.types.WorkSpaceTool):
     bl_idname = "retopo_pool.tool"
     bl_label = "Retopo Pool"
     bl_description = "Select and drag; Ctrl-click creates or cuts; Ctrl-Shift-click bridges edges"
-    bl_icon = "ops.mesh.polybuild"
+    bl_icon = TOOL_ICON
     bl_keymap = (
         ("mesh.retopo_pool_click", {"type": 'LEFTMOUSE', "value": 'PRESS', "any": True}, None),
         ("mesh.retopo_pool_hover", {"type": 'MOUSEMOVE', "value": 'ANY', "any": True}, None),
