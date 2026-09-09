@@ -5,7 +5,7 @@ Minimal retopology add-on for Blender 5.0.
 ## Install
 
 In Blender, open Edit > Preferences > Add-ons, use the menu's Install from Disk,
-and select `zips/retopo_pool-1.8.0.zip`. Enable Retopo Pool. Restart Blender after
+and select `zips/retopo_pool-1.10.0.zip`. Enable Retopo Pool. Restart Blender after
 updating an already enabled older version.
 
 ## Use
@@ -27,6 +27,21 @@ updating an already enabled older version.
   Finish or commit a pending triangle before bridging.
 
 ## Cuts and Subdivision
+
+Choose Retopo, Brush, or Box Select in the Retopo sidebar. Box Select activates
+Blender's native selection tool, including its normal modifier and X-Ray behavior.
+Choose Retopo or Brush in the sidebar to return from box selection.
+Shift-Alt-Q opens the Retopo Modes pie menu in Mesh Edit Mode, including while
+Box Select is active. Change its shortcut in Preferences > Add-ons > Retopo Pool.
+Enable Preserve Borders in the pie, sidebar, or brush tool settings to relax only
+interior surface vertices, leaving open borders and loose geometry fixed.
+
+In Brush mode, left-drag moves visible vertices inside the brush with a soft
+falloff. Hold Shift while dragging to relax geometry. Both operations snap to
+Reference when set. Press F and move the mouse horizontally to adjust the brush
+radius; left-click confirms and Esc/right-click cancels the size change.
+Esc/right-click during a brush stroke restores the original vertex positions.
+Brush strokes support normal undo and do not merge vertices.
 
 - Ctrl-left-drag an edge to preview a loop cut through its connected quad strip.
   New loop vertices snap to the nearest evaluated Reference surface with Offset;

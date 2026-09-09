@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Retopo Pool",
     "author": "Retopo Pool",
-    "version": (1, 8, 0),
+    "version": (1, 10, 0),
     "blender": (5, 0, 0),
     "location": "3D View > Sidebar > Retopo",
     "description": "Minimal surface retopology with progressive triangles and quads",
@@ -12,12 +12,13 @@ import bpy
 import bmesh
 import gpu
 import importlib
+from math import cos, sin, tau
 from pathlib import Path
 from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
-from bpy.props import PointerProperty, FloatProperty, IntProperty
+from bpy.props import PointerProperty, FloatProperty, IntProperty, EnumProperty
 from . import topology
 
 # Blender can reload the package after installation while retaining its submodules.
@@ -29,7 +30,17 @@ def mesh_filter(self, obj):
     return obj.type == 'MESH'
 
 
+def update_mode(self, context):
+    if context.mode == 'EDIT_MESH' and context.area and context.area.type == 'VIEW_3D':
+        topology.clear_pending(bmesh.from_edit_mesh(context.edit_object.data))
+        bpy.ops.wm.tool_set_by_id(name='builtin.select_box' if self.mode == 'BOX' else RP_Tool.bl_idname)
+        context.area.tag_redraw()
+
+
 class RP_Settings(bpy.types.PropertyGroup):
+    preserve_borders: bpy.props.BoolProperty(name="Preserve Borders", description="Relax only interior surface vertices, keeping open borders and loose geometry fixed", default=False)
+    mode: EnumProperty(name="Mode", items=(('RETOPO', "Retopo", "Create and move topology"), ('BRUSH', "Brush", "Move vertices; Shift relaxes"), ('BOX', "Box Select", "Blender's native box selection")), default='RETOPO', update=update_mode)
+    brush_radius: IntProperty(name="Brush Radius", default=75, min=5, max=500, subtype='PIXEL')
     target: PointerProperty(name="Reference", description="Optional mesh used for surface projection", type=bpy.types.Object, poll=mesh_filter)
     offset: FloatProperty(name="Offset", default=0.001, min=0, soft_max=0.1, subtype='DISTANCE')
     radius: IntProperty(name="Pick Radius", default=14, min=4, max=48, subtype='PIXEL')
@@ -274,7 +285,8 @@ class RP_OT_click(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        return context.mode == 'EDIT_MESH' and context.area.type == 'VIEW_3D' and context.region.type == 'WINDOW'
+        return (context.mode == 'EDIT_MESH' and context.area and context.area.type == 'VIEW_3D'
+                and context.region and context.region.type == 'WINDOW' and context.scene.retopo_pool.mode == 'RETOPO')
 
     def invoke(self, context, event):
         track_mouse(context, event)
@@ -537,6 +549,187 @@ def track_mouse(context, event):
     _mouse_region = context.region.as_pointer()
 
 
+def brush_vertices(context, bm, mouse):
+    matrix = context.edit_object.matrix_world
+    verts = list(bm.verts)
+    indices = {v: i for i, v in enumerate(verts)}
+    tree = BVHTree.FromPolygons([matrix @ v.co for v in verts],
+                              [tuple(indices[v] for v in f.verts) for f in bm.faces if not f.hide])
+    reference = reference_tree(context)
+    radius = context.scene.retopo_pool.brush_radius
+    result = []
+    for v in verts:
+        if v.hide:
+            continue
+        co = matrix @ v.co
+        screen = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, co)
+        if screen is None or (screen - mouse).length >= radius:
+            continue
+        if not visible_from_view(context, co, tree):
+            continue
+        if reference is not None and not visible_from_view(context, co, reference, reference_pick_tolerance(context, co)):
+            continue
+        t = 1 - (screen - mouse).length / radius
+        result.append((v, t * t * (3 - 2 * t)))
+    return result
+
+
+def relax_positions(weighted, preserve_borders=False):
+    positions = {}
+    for vert, weight in weighted:
+        if preserve_borders and (not vert.link_faces or any(not edge.is_manifold for edge in vert.link_edges)):
+            continue
+        edges = [edge for edge in vert.link_edges if not edge.hide and not edge.other_vert(vert).hide]
+        if vert.is_boundary:
+            edges = [edge for edge in edges if edge.is_boundary]
+        if edges:
+            average = sum((edge.other_vert(vert).co for edge in edges), Vector()) / len(edges)
+            positions[vert] = vert.co.lerp(average, 0.25 * weight)
+    return positions
+
+
+class RP_OT_brush(bpy.types.Operator):
+    bl_idname = "mesh.retopo_pool_brush"
+    bl_label = "Retopo Brush Stroke"
+    bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'EDIT_MESH' and context.area and context.area.type == 'VIEW_3D'
+                and context.region and context.region.type == 'WINDOW' and context.scene.retopo_pool.mode == 'BRUSH')
+
+    def invoke(self, context, event):
+        self.obj = context.edit_object
+        self.area, self.region = context.area, context.region
+        bm = bmesh.from_edit_mesh(self.obj.data)
+        bm.verts.index_update()
+        self.originals = [v.co.copy() for v in bm.verts]
+        self.counts = (len(bm.verts), len(bm.edges), len(bm.faces))
+        self.last = Vector((event.mouse_region_x, event.mouse_region_y))
+        self.weighted = [(v.index, weight) for v, weight in brush_vertices(context, bm, self.last)]
+        self.relaxing = event.shift
+        track_mouse(context, event)
+        if event.shift:
+            self.apply(context, self.last, True)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def apply(self, context, mouse, relaxing):
+        bm = bmesh.from_edit_mesh(self.obj.data)
+        bm.verts.ensure_lookup_table()
+        bm.verts.index_update()
+        if relaxing != self.relaxing:
+            self.weighted = [(v.index, weight) for v, weight in brush_vertices(context, bm, self.last)]
+        snap = reference_projector(context)
+        if relaxing:
+            positions = relax_positions(brush_vertices(context, bm, mouse), context.scene.retopo_pool.preserve_borders)
+        else:
+            matrix = self.obj.matrix_world
+            inverse = matrix.inverted_safe().to_3x3()
+            positions = {}
+            # Edit-mesh updates can invalidate BMVert wrappers between modal events.
+            for index, weight in self.weighted:
+                vert = bm.verts[index]
+                depth = matrix @ vert.co
+                a = view3d_utils.region_2d_to_location_3d(context.region, context.region_data, self.last, depth)
+                b = view3d_utils.region_2d_to_location_3d(context.region, context.region_data, mouse, depth)
+                positions[vert] = vert.co + inverse @ (b - a) * weight
+        for vert, co in positions.items():
+            vert.co = snap(co) if snap else co
+        self.last, self.relaxing = mouse, relaxing
+        sync(self.obj, destructive=False)
+
+    def modal(self, context, event):
+        if context.mode != 'EDIT_MESH' or context.edit_object != self.obj:
+            return {'CANCELLED'}
+        bm = bmesh.from_edit_mesh(self.obj.data)
+        if (len(bm.verts), len(bm.edges), len(bm.faces)) != self.counts:
+            self.report({'WARNING'}, "Brush stopped because mesh topology changed")
+            return {'CANCELLED'}
+        track_mouse(context, event)
+        if event.type in {'ESC', 'RIGHTMOUSE'}:
+            for vert, co in zip(bm.verts, self.originals):
+                vert.co = co
+            sync(self.obj, destructive=False)
+            return {'CANCELLED'}
+        if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+            return {'FINISHED'}
+        if event.type == 'MOUSEMOVE':
+            mouse = Vector((event.mouse_x - self.region.x, event.mouse_y - self.region.y))
+            with context.temp_override(area=self.area, region=self.region):
+                self.apply(context, mouse, event.shift)
+        self.area.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+
+class RP_OT_brush_size(bpy.types.Operator):
+    bl_idname = "mesh.retopo_pool_brush_size"
+    bl_label = "Adjust Brush Radius"
+    bl_options = {'INTERNAL', 'BLOCKING'}
+
+    @classmethod
+    def poll(cls, context):
+        return RP_OT_brush.poll(context)
+
+    def invoke(self, context, event):
+        self.original = context.scene.retopo_pool.brush_radius
+        self.start_x = event.mouse_x
+        track_mouse(context, event)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type in {'ESC', 'RIGHTMOUSE'}:
+            context.scene.retopo_pool.brush_radius = self.original
+            context.area.tag_redraw()
+            return {'CANCELLED'}
+        if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+            return {'FINISHED'}
+        if event.type == 'MOUSEMOVE':
+            context.scene.retopo_pool.brush_radius = max(5, min(500, self.original + event.mouse_x - self.start_x))
+            context.area.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+
+class RP_OT_mode(bpy.types.Operator):
+    bl_idname = "mesh.retopo_pool_mode"
+    bl_label = "Set Retopo Mode"
+    mode: EnumProperty(items=(('RETOPO', "Retopo", ""), ('BRUSH', "Brush", ""), ('BOX', "Box Select", "")))
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH' and context.area and context.area.type == 'VIEW_3D'
+
+    def execute(self, context):
+        context.scene.retopo_pool.mode = self.mode
+        return {'FINISHED'}
+
+
+class RP_MT_modes(bpy.types.Menu):
+    bl_label = "Retopo Modes"
+    bl_idname = "RP_MT_modes"
+
+    def draw(self, context):
+        pie = self.layout.menu_pie()
+        for mode, label, icon in (('RETOPO', "Retopo", 'EDITMODE_HLT'), ('BRUSH', "Brush", 'BRUSH_DATA'), ('BOX', "Box Select", 'SELECT_SET')):
+            pie.operator("mesh.retopo_pool_mode", text=label, icon=icon).mode = mode
+        pie.prop(context.scene.retopo_pool, "preserve_borders")
+
+
+class RP_Preferences(bpy.types.AddonPreferences):
+    bl_idname = __package__
+
+    def draw(self, context):
+        import rna_keymap_ui
+        keyconfig = context.window_manager.keyconfigs.user
+        keymap = keyconfig.keymaps.get('Mesh')
+        if keymap:
+            for item in keymap.keymap_items:
+                if item.idname == 'wm.call_menu_pie' and item.properties.name == RP_MT_modes.bl_idname:
+                    self.layout.context_pointer_set("keymap", keymap)
+                    rna_keymap_ui.draw_kmi([], keyconfig, keymap, item, self.layout, 0)
+
+
 class RP_OT_hover(bpy.types.Operator):
     bl_idname = "mesh.retopo_pool_hover"
     bl_label = "Retopo Pool Preview"
@@ -556,6 +749,8 @@ class RP_Tool(bpy.types.WorkSpaceTool):
     bl_description = "Select and drag; Ctrl-click creates or cuts; Ctrl-Shift-click bridges edges"
     bl_icon = TOOL_ICON
     bl_keymap = (
+        ("mesh.retopo_pool_brush", {"type": 'LEFTMOUSE', "value": 'PRESS', "any": True}, None),
+        ("mesh.retopo_pool_brush_size", {"type": 'F', "value": 'PRESS'}, None),
         ("mesh.retopo_pool_click", {"type": 'LEFTMOUSE', "value": 'PRESS', "any": True}, None),
         ("mesh.retopo_pool_hover", {"type": 'MOUSEMOVE', "value": 'ANY', "any": True}, None),
         ("mesh.retopo_pool_hover", {"type": 'LEFT_CTRL', "value": 'ANY', "any": True}, None),
@@ -563,6 +758,12 @@ class RP_Tool(bpy.types.WorkSpaceTool):
         ("mesh.retopo_pool_hover", {"type": 'LEFT_SHIFT', "value": 'ANY', "any": True}, None),
         ("mesh.retopo_pool_hover", {"type": 'RIGHT_SHIFT', "value": 'ANY', "any": True}, None),
     )
+
+    def draw_settings(context, layout, tool):
+        layout.prop(context.scene.retopo_pool, "mode", expand=True)
+        if context.scene.retopo_pool.mode == 'BRUSH':
+            layout.prop(context.scene.retopo_pool, "brush_radius")
+            layout.prop(context.scene.retopo_pool, "preserve_borders")
 
 
 class RP_OT_activate(bpy.types.Operator):
@@ -595,7 +796,7 @@ class RP_OT_activate(bpy.types.Operator):
         if context.scene.retopo_pool.target == context.edit_object:
             context.scene.retopo_pool.target = None
         context.tool_settings.mesh_select_mode = (True, False, False)
-        bpy.ops.wm.tool_set_by_id(name=RP_Tool.bl_idname)
+        bpy.ops.wm.tool_set_by_id(name='builtin.select_box' if context.scene.retopo_pool.mode == 'BOX' else RP_Tool.bl_idname)
         return {'FINISHED'}
 
 
@@ -627,6 +828,10 @@ class RP_PT_panel(bpy.types.Panel):
         running = tool and tool.idname == RP_Tool.bl_idname
         layout.operator("mesh.retopo_pool_stop" if running else "mesh.retopo_pool_activate", icon='PAUSE' if running else 'PLAY')
         settings = context.scene.retopo_pool
+        layout.prop(settings, "mode", expand=True)
+        if settings.mode == 'BRUSH':
+            layout.prop(settings, "brush_radius")
+            layout.prop(settings, "preserve_borders")
         layout.prop(settings, "target")
         layout.prop(settings, "offset")
         layout.prop(settings, "radius")
@@ -648,6 +853,14 @@ def draw_hover():
         return
     mouse = Vector(context.window_manager.retopo_pool_mouse) - Vector((context.region.x, context.region.y))
     if not (0 <= mouse.x < context.region.width and 0 <= mouse.y < context.region.height):
+        return
+    if context.scene.retopo_pool.mode == 'BRUSH':
+        radius = context.scene.retopo_pool.brush_radius
+        points = [(mouse.x + radius * cos(tau * i / 64), mouse.y + radius * sin(tau * i / 64), 0) for i in range(65)]
+        shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+        shader.bind()
+        shader.uniform_float("color", (1.0, 0.65, 0.15, 1.0) if context.window_manager.retopo_pool_shift else (0.15, 0.9, 0.65, 1.0))
+        batch_for_shader(shader, 'LINE_STRIP', {"pos": points}).draw(shader)
         return
     bm = bmesh.from_edit_mesh(context.edit_object.data)
     hit = pick(context, bm, mouse)
@@ -698,8 +911,9 @@ def draw_hover():
         gpu.state.blend_set('NONE')
 
 
-classes = (RP_Settings, RP_OT_click, RP_OT_hover, RP_OT_activate, RP_OT_stop, RP_PT_panel)
+classes = (RP_Settings, RP_OT_click, RP_OT_brush, RP_OT_brush_size, RP_OT_mode, RP_MT_modes, RP_Preferences, RP_OT_hover, RP_OT_activate, RP_OT_stop, RP_PT_panel)
 _draw_handle = None
+_addon_keymaps = []
 
 
 def register():
@@ -716,11 +930,20 @@ def register():
     bpy.types.WindowManager.retopo_pool_ctrl = bpy.props.BoolProperty(default=False)
     bpy.types.WindowManager.retopo_pool_shift = bpy.props.BoolProperty(default=False)
     bpy.utils.register_tool(RP_Tool, after={"builtin.poly_build"}, separator=True)
+    keyconfig = bpy.context.window_manager.keyconfigs.addon
+    if keyconfig:
+        keymap = keyconfig.keymaps.new(name='Mesh', space_type='EMPTY')
+        item = keymap.keymap_items.new('wm.call_menu_pie', 'Q', 'PRESS', alt=True, shift=True)
+        item.properties.name = RP_MT_modes.bl_idname
+        _addon_keymaps.append((keymap, item))
     _draw_handle = bpy.types.SpaceView3D.draw_handler_add(draw_hover, (), 'WINDOW', 'POST_PIXEL')
 
 
 def unregister():
     global _draw_handle
+    for keymap, item in _addon_keymaps:
+        keymap.keymap_items.remove(item)
+    _addon_keymaps.clear()
     for handlers in (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.undo_post,
                      bpy.app.handlers.redo_post, bpy.app.handlers.load_post):
         if invalidate_visibility in handlers:
