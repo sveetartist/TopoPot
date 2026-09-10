@@ -37,8 +37,9 @@ Enable Preserve Borders in the pie, sidebar, or brush tool settings to relax onl
 interior surface vertices, leaving open borders and loose geometry fixed.
 Enable Quad Only in Retopo mode to reject shared-endpoint triangle bridges and
 discard pending triangle faces when selecting away, cutting, or deactivating.
-The first triangle in the normal strip workflow is still allowed as the temporary
-half of the next quad.
+Each click away from the active edge extrudes a complete quad, with the new edge
+centered at the cursor and selected for the next extrusion. Clicking an existing
+vertex snaps one new corner to it; clicking another boundary edge bridges a quad.
 
 In Brush mode, left-drag moves visible vertices inside the brush with a soft
 falloff. Hold Shift while dragging to relax geometry. Both operations snap to

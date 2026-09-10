@@ -122,7 +122,46 @@ def recalculate_face_normals(bm):
     return True
 
 
+def extrude_quad(bm, anchor, point, target=None):
+    """Place the new edge's midpoint at point, or snap one corner to target."""
+    if len(anchor.link_faces) > 1:
+        raise ValueError("Start from a boundary or loose edge")
+    a, b = oriented(anchor, point)
+    offset = point - (a.co + b.co) * 0.5
+    created = []
+    try:
+        if target is None:
+            c = bm.verts.new(b.co + offset)
+            created.append(c)
+            d = bm.verts.new(a.co + offset)
+            created.append(d)
+        elif (target.co - b.co).length_squared <= (target.co - a.co).length_squared:
+            c = target
+            d = bm.verts.new(a.co + target.co - b.co)
+            created.append(d)
+        else:
+            d = target
+            c = bm.verts.new(b.co + target.co - a.co)
+            created.append(c)
+        check_face(bm, [a, b, c, d])
+        face = bm.faces.new((a, b, c, d))
+    except Exception:
+        for vertex in created:
+            if vertex.is_valid and not vertex.link_edges:
+                bm.verts.remove(vertex)
+        raise
+    if anchor.link_faces:
+        source = next((f for f in anchor.link_faces if f != face), None)
+        if source is not None:
+            face.material_index = source.material_index
+    clear_pending(bm)
+    select(bm, bm.edges.get((c, d)))
+    return face
+
+
 def extend(bm, anchor, vertex, quad_only=False):
+    if quad_only and isinstance(anchor, bmesh.types.BMEdge) and not pending(bm):
+        return extrude_quad(bm, anchor, vertex.co, target=vertex)
     # Adding a custom-data layer can invalidate existing wrappers in that domain.
     anchor_verts = tuple(anchor.verts) if isinstance(anchor, bmesh.types.BMEdge) else None
     face_layer = bm.faces.layers.int.get(PENDING) or bm.faces.layers.int.new(PENDING)
@@ -244,6 +283,8 @@ def _apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False
         return hit
     if hit is None and point is None:
         raise ValueError("Cursor is outside the reference surface")
+    if quad_only and isinstance(anchor, bmesh.types.BMEdge) and not pending(bm):
+        return extrude_quad(bm, anchor, hit.co if hit is not None else point, target=hit)
     return extend(bm, anchor, hit if hit is not None else bm.verts.new(point), quad_only)
 
 

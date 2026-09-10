@@ -1,7 +1,7 @@
 bl_info = {
     "name": "TopoPot - Retopology tool for Blender",
     "author": "ArtVit",
-    "version": (1, 13, 5),
+    "version": (1, 13, 6),
     "blender": (5, 0, 0),
     "location": "3D View > Sidebar > TopoPot",
     "description": "Minimalistic retopology with quality tools. Cook your topology.",
@@ -42,7 +42,7 @@ COLOR_PRESET_ITEMS = (
     ('CUSTOM', "Custom", ""),
 )
 DEFAULT_OVERLAY_COLOR = COLOR_PRESETS['BLUE'][:3]
-DEFAULT_OVERLAY_OPACITY = 0.35
+DEFAULT_OVERLAY_OPACITY = 0.25
 
 
 def mesh_filter(self, obj):
@@ -105,7 +105,7 @@ def update_mode(self, context):
 class RP_Settings(bpy.types.PropertyGroup):
     preserve_borders: bpy.props.BoolProperty(name="Preserve Borders", description="Relax only interior surface vertices, keeping open borders and loose geometry fixed", default=False)
     mode: EnumProperty(name="Mode", items=(('RETOPO', "Retopo", "Create and move topology"), ('BRUSH', "Brush", "Move vertices; Shift relaxes"), ('BOX', "Box Select", "Blender's native box selection")), default='RETOPO', update=update_mode)
-    quad_only: BoolProperty(name="Quad Only", description="Allow temporary pending triangles while building quads, but discard or reject operations that would leave triangle faces", default=False)
+    quad_only: BoolProperty(name="Quad Only", description="Extrude a complete quad from the active edge on each click, with the new edge centered at the cursor", default=False)
     brush_radius: IntProperty(name="Brush Radius", default=75, min=5, max=500, subtype='PIXEL')
     target: PointerProperty(name="Reference", description="Optional mesh used for surface projection", type=bpy.types.Object, poll=mesh_filter)
     offset: FloatProperty(name="Offset", default=0.001, min=0, soft_max=0.1, subtype='DISTANCE')
