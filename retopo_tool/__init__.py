@@ -1,7 +1,7 @@
 bl_info = {
     "name": "TopoPot - Retopology tool for Blender",
     "author": "ArtVit",
-    "version": (1, 13, 6),
+    "version": (1, 14, 12),
     "blender": (5, 0, 0),
     "location": "3D View > Sidebar > TopoPot",
     "description": "Minimalistic retopology with quality tools. Cook your topology.",
@@ -105,7 +105,7 @@ def update_mode(self, context):
 class RP_Settings(bpy.types.PropertyGroup):
     preserve_borders: bpy.props.BoolProperty(name="Preserve Borders", description="Relax only interior surface vertices, keeping open borders and loose geometry fixed", default=False)
     mode: EnumProperty(name="Mode", items=(('RETOPO', "Retopo", "Create and move topology"), ('BRUSH', "Brush", "Move vertices; Shift relaxes"), ('BOX', "Box Select", "Blender's native box selection")), default='RETOPO', update=update_mode)
-    quad_only: BoolProperty(name="Quad Only", description="Extrude a complete quad from the active edge on each click, with the new edge centered at the cursor", default=False)
+    quad_only: BoolProperty(name="Quad Mode", description="Extrude quads with the new edge centered at the cursor; allow triangles when connecting neighboring edges", default=False)
     brush_radius: IntProperty(name="Brush Radius", default=75, min=5, max=500, subtype='PIXEL')
     target: PointerProperty(name="Reference", description="Optional mesh used for surface projection", type=bpy.types.Object, poll=mesh_filter)
     offset: FloatProperty(name="Offset", default=0.001, min=0, soft_max=0.1, subtype='DISTANCE')
@@ -308,7 +308,22 @@ def edge_drag_positions(context, originals, start, mouse, snap=None):
     return [snap(co) for co in positions] if snap is not None else positions
 
 
-def preview(bm, anchor, hit, point, edge_factor=0.5, bridge_mode=False, with_kind=False, strict=False, project=None, quad_only=False):
+def quad_snap_distance(context):
+    matrix = context.edit_object.matrix_world.copy()
+    inverse = matrix.inverted_safe()
+    def distance(co):
+        world = matrix @ co
+        screen = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, world)
+        if screen is None:
+            return 0.0
+        displaced = view3d_utils.region_2d_to_location_3d(
+            context.region, context.region_data,
+            screen + Vector((context.scene.retopo_tool.merge_radius * 4, 0)), world)
+        return (inverse @ displaced - co).length
+    return distance
+
+
+def preview(bm, anchor, hit, point, edge_factor=0.5, bridge_mode=False, with_kind=False, strict=False, project=None, quad_only=False, snap_distance=None, snapped_points=None):
     """Run the actual operation on a disposable mesh so preview and commit agree."""
     copy = bm.copy()
     try:
@@ -320,7 +335,7 @@ def preview(bm, anchor, hit, point, edge_factor=0.5, bridge_mode=False, with_kin
             return destination[list(source).index(element)]
 
         anchor, hit = mapped(anchor), mapped(hit)
-        result = topology.apply_click(copy, anchor, hit, point, edge_factor, bridge_mode, project, quad_only)
+        result = topology.apply_click(copy, anchor, hit, point, edge_factor, bridge_mode, project, quad_only, snap_distance, snapped_points)
         if isinstance(result, list):
             kind = 'LINES'
             coords = [v.co.copy() for edge in result for v in edge.verts]
@@ -330,6 +345,8 @@ def preview(bm, anchor, hit, point, edge_factor=0.5, bridge_mode=False, with_kin
             coords = [v.co.copy() for v in verts]
         return (kind, coords) if with_kind else coords
     except ValueError:
+        if snapped_points is not None:
+            snapped_points.clear()
         if strict:
             raise
         return ('POINTS', []) if with_kind else []
@@ -387,8 +404,8 @@ class RP_OT_click(bpy.types.Operator):
                 factor = edge_parameter(context, hit, mouse) if isinstance(hit, bmesh.types.BMEdge) else 0.5
                 # Validate on a copy before splitting any live edges.
                 snap = reference_projector(context)
-                preview(bm, anchor, hit, point, factor, event.shift, strict=True, project=snap, quad_only=settings.quad_only)
-                topology.apply_click(bm, anchor, hit, point, factor, event.shift, project=snap, quad_only=settings.quad_only)
+                preview(bm, anchor, hit, point, factor, event.shift, strict=True, project=snap, quad_only=settings.quad_only, snap_distance=quad_snap_distance(context))
+                topology.apply_click(bm, anchor, hit, point, factor, event.shift, project=snap, quad_only=settings.quad_only, snap_distance=quad_snap_distance(context))
                 sync(obj)
             except ValueError as error:
                 self.report({'WARNING'}, str(error))
@@ -542,8 +559,8 @@ class RP_OT_click(bpy.types.Operator):
             elif release:
                 anchor = topology.active(bm)
                 snap = reference_projector(context)
-                preview(bm, anchor, edge, None, factor, strict=True, project=snap, quad_only=context.scene.retopo_tool.quad_only)
-                topology.apply_click(bm, anchor, edge, edge_factor=factor, project=snap, quad_only=context.scene.retopo_tool.quad_only)
+                preview(bm, anchor, edge, None, factor, strict=True, project=snap, quad_only=context.scene.retopo_tool.quad_only, snap_distance=quad_snap_distance(context))
+                topology.apply_click(bm, anchor, edge, edge_factor=factor, project=snap, quad_only=context.scene.retopo_tool.quad_only, snap_distance=quad_snap_distance(context))
             if release:
                 sync(self.obj)
         except ValueError as error:
@@ -579,11 +596,11 @@ class RP_OT_click(bpy.types.Operator):
                 raise ValueError("Release over a vertex to connect")
             anchor = start if self.dragging else topology.active(bm)
             snap = reference_projector(context)
-            kind, coords = preview(bm, anchor, hit, None, with_kind=True, strict=True, project=snap, quad_only=context.scene.retopo_tool.quad_only)
+            kind, coords = preview(bm, anchor, hit, None, with_kind=True, strict=True, project=snap, quad_only=context.scene.retopo_tool.quad_only, snap_distance=quad_snap_distance(context))
             if self.dragging:
                 _loop_preview = (self.region.as_pointer(), coords if kind == 'LINES' else [])
             if release:
-                topology.apply_click(bm, anchor, hit, project=snap, quad_only=context.scene.retopo_tool.quad_only)
+                topology.apply_click(bm, anchor, hit, project=snap, quad_only=context.scene.retopo_tool.quad_only, snap_distance=quad_snap_distance(context))
                 sync(self.obj)
         except ValueError as error:
             _loop_preview = (self.region.as_pointer(), [])
@@ -958,6 +975,7 @@ def draw_hover():
     polygons = []
     kind = 'POINTS'
     preview_color = retopo_color(context)
+    snapped_points = []
     if _loop_preview is not None and _loop_preview[0] == context.region.as_pointer():
         kind, polygons = 'LINES', _loop_preview[1]
     elif context.window_manager.retopo_tool_ctrl:
@@ -966,7 +984,7 @@ def draw_hover():
         factor = edge_parameter(context, hit, mouse) if isinstance(hit, bmesh.types.BMEdge) else 0.5
         kind, polygons = preview(bm, anchor, hit, matrix.inverted_safe() @ point if point is not None else None,
                                  factor, context.window_manager.retopo_tool_shift, with_kind=True,
-                                 project=reference_projector(context), quad_only=settings.quad_only)
+                                 project=reference_projector(context), quad_only=settings.quad_only, snap_distance=quad_snap_distance(context), snapped_points=snapped_points)
 
     def screen(coords):
         result = [view3d_utils.location_3d_to_region_2d(context.region, context.region_data, matrix @ co) for co in coords]
@@ -990,6 +1008,10 @@ def draw_hover():
             draw('LINE_STRIP', points + [points[0]], preview_color)
         else:
             draw(kind, points, preview_color)
+        if snapped_points:
+            gpu.state.point_size_set(15)
+            draw('POINTS', screen(snapped_points), (*preview_color[:3], 1.0))
+            gpu.state.point_size_set(9)
         if hit is not None:
             verts = [hit] if isinstance(hit, bmesh.types.BMVert) else hit.verts
             draw('POINTS' if len(verts) == 1 else 'LINES', screen([v.co for v in verts]), preview_color)

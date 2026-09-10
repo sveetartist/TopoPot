@@ -131,10 +131,30 @@ def extrude_quad(bm, anchor, point, target=None):
     created = []
     try:
         if target is None:
-            c = bm.verts.new(b.co + offset)
+            span = b.co - a.co
+            # Turn the outer edge perpendicular to the stroke in the plane
+            # defined by the source edge and cursor, preserving strip width.
+            direction = offset.normalized()
+            turned = span - direction * span.dot(direction)
+            if turned.length > 1e-10:
+                turned = turned.normalized() * span.length
+            else:
+                turned = span.copy()
+            c = bm.verts.new(point + turned * 0.5)
             created.append(c)
-            d = bm.verts.new(a.co + offset)
+            d = bm.verts.new(point - turned * 0.5)
             created.append(d)
+            # A sharp turn close to the source can fold the quad. Reduce
+            # rotation until it fits, keeping the cursor at the midpoint.
+            for attempt in range(9):
+                try:
+                    check_face(bm, [a, b, c, d])
+                    break
+                except ValueError:
+                    weight = 0.5 ** (attempt + 1) if attempt < 8 else 0.0
+                    adjusted = span.lerp(turned, weight).normalized() * span.length
+                    c.co = point + adjusted * 0.5
+                    d.co = point - adjusted * 0.5
         elif (target.co - b.co).length_squared <= (target.co - a.co).length_squared:
             c = target
             d = bm.verts.new(a.co + target.co - b.co)
@@ -213,8 +233,6 @@ def bridge(bm, source, target, quad_only=False):
     if source == target or len(source.link_faces) > 1 or len(target.link_faces) > 1:
         raise ValueError("Choose another boundary or loose edge")
     verts = bridge_verts(source, target)
-    if quad_only and len(verts) != 4:
-        raise ValueError("Quad-only mode needs four corners")
     check_face(bm, verts)
     # Adjacent existing faces must traverse a shared edge in opposite directions.
     if has_target_winding_conflict(target, verts):
@@ -251,13 +269,49 @@ def connect_cut(bm, start, end, discard_pending=False):
     return result
 
 
-def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, project=None, quad_only=False):
-    original = set(bm.verts) if project is not None else None
+def snap_quad(bm, face, original, snap_distance, snapped_points=None):
+    corners = list(face.verts)
+    outer = active(bm)
+    outer_verts = list(outer.verts) if isinstance(outer, bmesh.types.BMEdge) else []
+    for corner in list(corners):
+        if corner in original:
+            continue
+        radius = snap_distance(corner.co)
+        candidates = []
+        for vertex in original:
+            if vertex.is_valid and not vertex.hide and vertex not in corners:
+                candidates.append(((vertex.co - corner.co).length, vertex, vertex.co.copy()))
+        candidates = [item for item in candidates if item[0] <= radius]
+        for distance, target, co in sorted(candidates, key=lambda item: item[0]):
+            old = corner.co.copy()
+            corner.co = co
+            proposed = [target if v == corner else v for v in corners]
+            try:
+                check_face(bm, proposed, replacing=face)
+            except ValueError:
+                corner.co = old
+                continue
+            if snapped_points is not None:
+                snapped_points.append(target.co.copy())
+            corners = [target if v == corner else v for v in corners]
+            outer_verts = [target if v == corner else v for v in outer_verts]
+            bmesh.ops.weld_verts(bm, targetmap={corner: target})
+            face = next(f for f in target.link_faces if set(f.verts) == set(corners))
+            break
+    if len(outer_verts) == 2:
+        select(bm, bm.edges.get(outer_verts))
+    return face
+
+
+def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, project=None, quad_only=False, snap_distance=None, snapped_points=None):
+    original = set(bm.verts)
     result = _apply_click(bm, anchor, hit, point, edge_factor, bridge_mode, quad_only)
     if project is not None:
         positions = [(v, project(v.co)) for v in bm.verts if v not in original]
         for vertex, position in positions:
             vertex.co = position
+    if quad_only and snap_distance is not None and isinstance(result, bmesh.types.BMFace):
+        result = snap_quad(bm, result, original, snap_distance, snapped_points)
     return result
 
 
