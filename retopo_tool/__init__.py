@@ -1,9 +1,9 @@
 bl_info = {
     "name": "TopoPot - Retopology tool for Blender",
     "author": "ArtVit",
-    "version": (1, 12, 1),
+    "version": (1, 13, 5),
     "blender": (5, 0, 0),
-    "location": "3D View > Sidebar > Retopo",
+    "location": "3D View > Sidebar > TopoPot",
     "description": "Minimalistic retopology with quality tools. Cook your topology.",
     "category": "Mesh",
 }
@@ -18,21 +18,86 @@ from bpy_extras import view3d_utils
 from gpu_extras.batch import batch_for_shader
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
-from bpy.props import PointerProperty, FloatProperty, IntProperty, EnumProperty
+from bpy.props import PointerProperty, FloatProperty, IntProperty, EnumProperty, FloatVectorProperty, BoolProperty
 from . import topology
 
 # Blender can reload the package after installation while retaining its submodules.
 topology = importlib.reload(topology)
 TOOL_ICON = str(Path(__file__).resolve().parent / "assets" / "retopo_icon")
+COLOR_PRESETS = {
+    'BLUE': (0.2, 0.65, 1.0, 1.0),
+    'GREEN': (0.15, 0.9, 0.65, 1.0),
+    'ORANGE': (1.0, 0.55, 0.15, 1.0),
+    'PURPLE': (0.75, 0.35, 1.0, 1.0),
+    'PINK': (1.0, 0.25, 0.45, 1.0),
+    'WHITE': (1.0, 1.0, 1.0, 1.0),
+}
+COLOR_PRESET_ITEMS = (
+    ('BLUE', "Blue", ""),
+    ('GREEN', "Green", ""),
+    ('ORANGE', "Orange", ""),
+    ('PURPLE', "Purple", ""),
+    ('PINK', "Pink", ""),
+    ('WHITE', "White", ""),
+    ('CUSTOM', "Custom", ""),
+)
+DEFAULT_OVERLAY_COLOR = COLOR_PRESETS['BLUE'][:3]
+DEFAULT_OVERLAY_OPACITY = 0.35
 
 
 def mesh_filter(self, obj):
     return obj.type == 'MESH'
 
 
+def tag_view3d_redraw(context=None):
+    window_manager = (context or bpy.context).window_manager if (context or bpy.context) else None
+    if not window_manager:
+        return
+    for window in window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+
+def addon_preferences(context=None):
+    prefs = (context or bpy.context).preferences
+    addon = prefs.addons.get(__package__)
+    return addon.preferences if addon else None
+
+
+def update_retopo_color_preset(self, context):
+    if self.retopo_color_preset in COLOR_PRESETS:
+        self.retopo_color = COLOR_PRESETS[self.retopo_color_preset]
+    tag_view3d_redraw(context)
+
+
+def update_retopo_color(self, context):
+    preset_color = COLOR_PRESETS.get(self.retopo_color_preset)
+    if preset_color and any(abs(a - b) > 1e-4 for a, b in zip(self.retopo_color, preset_color)):
+        self.retopo_color_preset = 'CUSTOM'
+    tag_view3d_redraw(context)
+
+
+def apply_overlay_preferences(prefs=None, context=None):
+    prefs = prefs or addon_preferences(context)
+    color = tuple(prefs.overlay_color) if prefs else DEFAULT_OVERLAY_COLOR
+    opacity = prefs.overlay_opacity if prefs else DEFAULT_OVERLAY_OPACITY
+    bpy.context.preferences.themes[0].view_3d.face_retopology = (*color, opacity)
+    tag_view3d_redraw(context)
+
+
+def update_overlay_preferences(self, context):
+    apply_overlay_preferences(self, context)
+
+
+def retopo_color(context):
+    prefs = addon_preferences(context)
+    return tuple(prefs.retopo_color) if prefs else COLOR_PRESETS['BLUE']
+
+
 def update_mode(self, context):
     if context.mode == 'EDIT_MESH' and context.area and context.area.type == 'VIEW_3D':
-        topology.clear_pending(bmesh.from_edit_mesh(context.edit_object.data))
+        topology.clear_pending(bmesh.from_edit_mesh(context.edit_object.data), discard=self.quad_only)
         bpy.ops.wm.tool_set_by_id(name='builtin.select_box' if self.mode == 'BOX' else RP_Tool.bl_idname)
         context.area.tag_redraw()
 
@@ -40,12 +105,13 @@ def update_mode(self, context):
 class RP_Settings(bpy.types.PropertyGroup):
     preserve_borders: bpy.props.BoolProperty(name="Preserve Borders", description="Relax only interior surface vertices, keeping open borders and loose geometry fixed", default=False)
     mode: EnumProperty(name="Mode", items=(('RETOPO', "Retopo", "Create and move topology"), ('BRUSH', "Brush", "Move vertices; Shift relaxes"), ('BOX', "Box Select", "Blender's native box selection")), default='RETOPO', update=update_mode)
+    quad_only: BoolProperty(name="Quad Only", description="Allow temporary pending triangles while building quads, but discard or reject operations that would leave triangle faces", default=False)
     brush_radius: IntProperty(name="Brush Radius", default=75, min=5, max=500, subtype='PIXEL')
     target: PointerProperty(name="Reference", description="Optional mesh used for surface projection", type=bpy.types.Object, poll=mesh_filter)
     offset: FloatProperty(name="Offset", default=0.001, min=0, soft_max=0.1, subtype='DISTANCE')
     radius: IntProperty(name="Pick Radius", default=14, min=4, max=48, subtype='PIXEL')
     merge_radius: IntProperty(name="Merge Radius", description="Snap and merge a dragged vertex within this screen distance", default=10, min=3, max=32, subtype='PIXEL')
-    reference_tolerance: IntProperty(name="Reference Tolerance", description="Allow selection slightly below Reference, using this many screen pixels as a depth allowance; zero uses strict occlusion", default=12, min=0, max=64, subtype='PIXEL')
+    reference_tolerance: IntProperty(name="Reference Tolerance", description="Allow selection slightly below Reference, using this many screen pixels as a depth allowance; zero uses strict occlusion", default=32, min=0, max=64, subtype='PIXEL')
 
 
 def project(context, mouse, depth):
@@ -242,7 +308,7 @@ def edge_drag_positions(context, originals, start, mouse, snap=None):
     return [snap(co) for co in positions] if snap is not None else positions
 
 
-def preview(bm, anchor, hit, point, edge_factor=0.5, bridge_mode=False, with_kind=False, strict=False, project=None):
+def preview(bm, anchor, hit, point, edge_factor=0.5, bridge_mode=False, with_kind=False, strict=False, project=None, quad_only=False):
     """Run the actual operation on a disposable mesh so preview and commit agree."""
     copy = bm.copy()
     try:
@@ -254,7 +320,7 @@ def preview(bm, anchor, hit, point, edge_factor=0.5, bridge_mode=False, with_kin
             return destination[list(source).index(element)]
 
         anchor, hit = mapped(anchor), mapped(hit)
-        result = topology.apply_click(copy, anchor, hit, point, edge_factor, bridge_mode, project)
+        result = topology.apply_click(copy, anchor, hit, point, edge_factor, bridge_mode, project, quad_only)
         if isinstance(result, list):
             kind = 'LINES'
             coords = [v.co.copy() for edge in result for v in edge.verts]
@@ -295,6 +361,7 @@ class RP_OT_click(bpy.types.Operator):
         mouse = Vector((event.mouse_region_x, event.mouse_region_y))
         hit = pick(context, bm, mouse)
         anchor = topology.active(bm)
+        settings = context.scene.retopo_tool
         if event.ctrl and isinstance(hit, bmesh.types.BMVert):
             bm.verts.index_update()
             self.vertex_index = hit.index
@@ -320,14 +387,14 @@ class RP_OT_click(bpy.types.Operator):
                 factor = edge_parameter(context, hit, mouse) if isinstance(hit, bmesh.types.BMEdge) else 0.5
                 # Validate on a copy before splitting any live edges.
                 snap = reference_projector(context)
-                preview(bm, anchor, hit, point, factor, event.shift, strict=True, project=snap)
-                topology.apply_click(bm, anchor, hit, point, factor, event.shift, project=snap)
+                preview(bm, anchor, hit, point, factor, event.shift, strict=True, project=snap, quad_only=settings.quad_only)
+                topology.apply_click(bm, anchor, hit, point, factor, event.shift, project=snap, quad_only=settings.quad_only)
                 sync(obj)
             except ValueError as error:
                 self.report({'WARNING'}, str(error))
                 return {'CANCELLED'}
             return {'FINISHED'}
-        topology.clear_pending(bm)
+        topology.clear_pending(bm, discard=settings.quad_only)
         if event.shift and hit is not None:
             hit.select_set(not hit.select)
             if hit.select:
@@ -391,7 +458,7 @@ class RP_OT_click(bpy.types.Operator):
                     target = pick(context, bm, mouse, exclude=vertex, vertices_only=True,
                                   radius=context.scene.retopo_tool.merge_radius)
                 if target is not None:
-                    topology.merge_vertices(bm, vertex, target)
+                    topology.merge_vertices(bm, vertex, target, context.scene.retopo_tool.quad_only)
                     sync(self.obj)
             _merge_target = None
             self.area.tag_redraw()
@@ -471,12 +538,12 @@ class RP_OT_click(bpy.types.Operator):
                 coords = topology.loop_preview(edge, factor, self.loop_projector)
                 _loop_preview = (self.region.as_pointer(), coords)
                 if release:
-                    topology.loop_cut(bm, edge, factor, self.loop_projector)
+                    topology.loop_cut(bm, edge, factor, self.loop_projector, context.scene.retopo_tool.quad_only)
             elif release:
                 anchor = topology.active(bm)
                 snap = reference_projector(context)
-                preview(bm, anchor, edge, None, factor, strict=True, project=snap)
-                topology.apply_click(bm, anchor, edge, edge_factor=factor, project=snap)
+                preview(bm, anchor, edge, None, factor, strict=True, project=snap, quad_only=context.scene.retopo_tool.quad_only)
+                topology.apply_click(bm, anchor, edge, edge_factor=factor, project=snap, quad_only=context.scene.retopo_tool.quad_only)
             if release:
                 sync(self.obj)
         except ValueError as error:
@@ -512,11 +579,11 @@ class RP_OT_click(bpy.types.Operator):
                 raise ValueError("Release over a vertex to connect")
             anchor = start if self.dragging else topology.active(bm)
             snap = reference_projector(context)
-            kind, coords = preview(bm, anchor, hit, None, with_kind=True, strict=True, project=snap)
+            kind, coords = preview(bm, anchor, hit, None, with_kind=True, strict=True, project=snap, quad_only=context.scene.retopo_tool.quad_only)
             if self.dragging:
                 _loop_preview = (self.region.as_pointer(), coords if kind == 'LINES' else [])
             if release:
-                topology.apply_click(bm, anchor, hit, project=snap)
+                topology.apply_click(bm, anchor, hit, project=snap, quad_only=context.scene.retopo_tool.quad_only)
                 sync(self.obj)
         except ValueError as error:
             _loop_preview = (self.region.as_pointer(), [])
@@ -718,16 +785,34 @@ class RP_MT_modes(bpy.types.Menu):
 
 class RP_Preferences(bpy.types.AddonPreferences):
     bl_idname = __package__
+    retopo_color_preset: EnumProperty(name="Retopo Color Preset", items=COLOR_PRESET_ITEMS, default='BLUE', update=update_retopo_color_preset)
+    retopo_color: FloatVectorProperty(name="Retopo Color", subtype='COLOR', size=4, min=0, max=1, default=COLOR_PRESETS['BLUE'], update=update_retopo_color)
+    overlay_color: FloatVectorProperty(name="Overlay Color", subtype='COLOR', size=3, min=0, max=1, default=DEFAULT_OVERLAY_COLOR, update=update_overlay_preferences)
+    overlay_opacity: FloatProperty(name="Overlay Opacity", subtype='FACTOR', min=0, max=1, default=DEFAULT_OVERLAY_OPACITY, update=update_overlay_preferences)
 
     def draw(self, context):
         import rna_keymap_ui
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        colors = layout.box()
+        colors.label(text="Retopo Colors")
+        colors.prop(self, "retopo_color_preset")
+        colors.prop(self, "retopo_color")
+
+        overlay = layout.box()
+        overlay.label(text="Blender Retopology Overlay")
+        overlay.prop(self, "overlay_color")
+        overlay.prop(self, "overlay_opacity")
+
         keyconfig = context.window_manager.keyconfigs.user
         keymap = keyconfig.keymaps.get('Mesh')
         if keymap:
             for item in keymap.keymap_items:
                 if item.idname == 'wm.call_menu_pie' and item.properties.name == RP_MT_modes.bl_idname:
-                    self.layout.context_pointer_set("keymap", keymap)
-                    rna_keymap_ui.draw_kmi([], keyconfig, keymap, item, self.layout, 0)
+                    layout.context_pointer_set("keymap", keymap)
+                    rna_keymap_ui.draw_kmi([], keyconfig, keymap, item, layout, 0)
 
 
 class RP_OT_hover(bpy.types.Operator):
@@ -764,6 +849,8 @@ class RP_Tool(bpy.types.WorkSpaceTool):
         if context.scene.retopo_tool.mode == 'BRUSH':
             layout.prop(context.scene.retopo_tool, "brush_radius")
             layout.prop(context.scene.retopo_tool, "preserve_borders")
+        elif context.scene.retopo_tool.mode == 'RETOPO':
+            layout.prop(context.scene.retopo_tool, "quad_only")
 
 
 class RP_OT_activate(bpy.types.Operator):
@@ -807,7 +894,7 @@ class RP_OT_stop(bpy.types.Operator):
 
     def execute(self, context):
         if context.edit_object:
-            topology.clear_pending(bmesh.from_edit_mesh(context.edit_object.data))
+            topology.clear_pending(bmesh.from_edit_mesh(context.edit_object.data), discard=context.scene.retopo_tool.quad_only)
             sync(context.edit_object)
         bpy.ops.wm.tool_set_by_id(name="builtin.select_box")
         return {'FINISHED'}
@@ -832,6 +919,8 @@ class RP_PT_panel(bpy.types.Panel):
         if settings.mode == 'BRUSH':
             layout.prop(settings, "brush_radius")
             layout.prop(settings, "preserve_borders")
+        elif settings.mode == 'RETOPO':
+            layout.prop(settings, "quad_only")
         layout.prop(settings, "target")
         layout.prop(settings, "offset")
         layout.prop(settings, "radius")
@@ -854,8 +943,9 @@ def draw_hover():
     mouse = Vector(context.window_manager.retopo_tool_mouse) - Vector((context.region.x, context.region.y))
     if not (0 <= mouse.x < context.region.width and 0 <= mouse.y < context.region.height):
         return
-    if context.scene.retopo_tool.mode == 'BRUSH':
-        radius = context.scene.retopo_tool.brush_radius
+    settings = context.scene.retopo_tool
+    if settings.mode == 'BRUSH':
+        radius = settings.brush_radius
         points = [(mouse.x + radius * cos(tau * i / 64), mouse.y + radius * sin(tau * i / 64), 0) for i in range(65)]
         shader = gpu.shader.from_builtin('UNIFORM_COLOR')
         shader.bind()
@@ -867,6 +957,7 @@ def draw_hover():
     matrix = context.edit_object.matrix_world
     polygons = []
     kind = 'POINTS'
+    preview_color = retopo_color(context)
     if _loop_preview is not None and _loop_preview[0] == context.region.as_pointer():
         kind, polygons = 'LINES', _loop_preview[1]
     elif context.window_manager.retopo_tool_ctrl:
@@ -875,7 +966,7 @@ def draw_hover():
         factor = edge_parameter(context, hit, mouse) if isinstance(hit, bmesh.types.BMEdge) else 0.5
         kind, polygons = preview(bm, anchor, hit, matrix.inverted_safe() @ point if point is not None else None,
                                  factor, context.window_manager.retopo_tool_shift, with_kind=True,
-                                 project=reference_projector(context))
+                                 project=reference_projector(context), quad_only=settings.quad_only)
 
     def screen(coords):
         result = [view3d_utils.location_3d_to_region_2d(context.region, context.region_data, matrix @ co) for co in coords]
@@ -895,16 +986,16 @@ def draw_hover():
         points = screen(polygons)
         if kind == 'FACE' and len(points) >= 3:
             triangles = [points[i] for i in ((0, 1, 2) if len(points) == 3 else (0, 1, 2, 0, 2, 3))]
-            draw('TRIS', triangles, (0.15, 0.9, 0.65, 0.25))
-            draw('LINE_STRIP', points + [points[0]], (0.15, 0.9, 0.65, 1.0))
+            draw('TRIS', triangles, (*preview_color[:3], preview_color[3] * 0.25))
+            draw('LINE_STRIP', points + [points[0]], preview_color)
         else:
-            draw(kind, points, (0.15, 0.9, 0.65, 1.0))
+            draw(kind, points, preview_color)
         if hit is not None:
             verts = [hit] if isinstance(hit, bmesh.types.BMVert) else hit.verts
-            draw('POINTS' if len(verts) == 1 else 'LINES', screen([v.co for v in verts]), (0.15, 0.9, 0.65, 1.0))
+            draw('POINTS' if len(verts) == 1 else 'LINES', screen([v.co for v in verts]), preview_color)
         if _merge_target is not None and _merge_target[0] == context.region.as_pointer():
             gpu.state.point_size_set(13)
-            draw('POINTS', screen([_merge_target[1]]), (1.0, 0.65, 0.15, 1.0))
+            draw('POINTS', screen([_merge_target[1]]), preview_color)
     finally:
         gpu.state.point_size_set(1)
         gpu.state.line_width_set(1)
@@ -929,6 +1020,7 @@ def register():
     bpy.types.WindowManager.retopo_tool_mouse = bpy.props.IntVectorProperty(size=2, default=(-100, -100))
     bpy.types.WindowManager.retopo_tool_ctrl = bpy.props.BoolProperty(default=False)
     bpy.types.WindowManager.retopo_tool_shift = bpy.props.BoolProperty(default=False)
+    apply_overlay_preferences()
     bpy.utils.register_tool(RP_Tool, after={"builtin.poly_build"}, separator=True)
     keyconfig = bpy.context.window_manager.keyconfigs.addon
     if keyconfig:

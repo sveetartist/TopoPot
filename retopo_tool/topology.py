@@ -3,11 +3,22 @@ import bmesh
 
 PENDING = "retopo_tool_pending"
 BASE = "retopo_tool_base"
+WINDING_ERROR = "Target edge has incompatible face winding. Flip normals."
 
 
-def clear_pending(bm):
-    for collection, name in ((bm.faces, PENDING), (bm.edges, BASE)):
-        layer = collection.layers.int.get(name)
+def clear_pending(bm, discard=False):
+    face_layer = bm.faces.layers.int.get(PENDING)
+    edge_layer = bm.edges.layers.int.get(BASE)
+    if discard and face_layer:
+        remove_edges = []
+        for face in list(bm.faces):
+            if face[face_layer]:
+                remove_edges.extend(edge for edge in face.edges if not (edge_layer and edge[edge_layer]))
+                bm.faces.remove(face)
+        for edge in remove_edges:
+            if edge.is_valid and not edge.link_faces:
+                bm.edges.remove(edge)
+    for collection, layer in ((bm.faces, face_layer), (bm.edges, edge_layer)):
         if layer:
             for item in collection:
                 item[layer] = 0
@@ -78,7 +89,40 @@ def oriented(edge, point):
     return (a, b) if (b.co - point).length <= (a.co - point).length else (b, a)
 
 
-def extend(bm, anchor, vertex):
+def bridge_verts(source, target):
+    a, b = oriented(source, sum((v.co for v in target.verts), target.verts[0].co * 0) / 2)
+    c, d = target.verts
+    shared = set(source.verts) & set(target.verts)
+    if shared:
+        return [a, b, next(v for v in target.verts if v not in shared)]
+    same_order = (b.co - c.co).length_squared + (a.co - d.co).length_squared
+    flipped_order = (b.co - d.co).length_squared + (a.co - c.co).length_squared
+    if flipped_order < same_order:
+        c, d = d, c
+    return [a, b, c, d]
+
+
+def has_target_winding_conflict(target, verts):
+    if not target.link_faces:
+        return False
+    loop = next(loop for loop in target.link_faces[0].loops if loop.edge == target)
+    pairs = list(zip(verts, verts[1:] + verts[:1]))
+    return (loop.vert, loop.link_loop_next.vert) in pairs
+
+
+def recalculate_face_normals(bm):
+    faces = list(bm.faces)
+    if not faces:
+        return False
+    try:
+        bmesh.ops.recalc_face_normals(bm, faces=faces)
+        bm.normal_update()
+    except Exception:
+        return False
+    return True
+
+
+def extend(bm, anchor, vertex, quad_only=False):
     # Adding a custom-data layer can invalidate existing wrappers in that domain.
     anchor_verts = tuple(anchor.verts) if isinstance(anchor, bmesh.types.BMEdge) else None
     face_layer = bm.faces.layers.int.get(PENDING) or bm.faces.layers.int.new(PENDING)
@@ -112,12 +156,12 @@ def extend(bm, anchor, vertex):
         a, b = oriented(anchor, vertex.co)
         check_face(bm, [a, b, vertex])
         face = bm.faces.new((a, b, vertex))
-        clear_pending(bm)
+        clear_pending(bm, discard=quad_only)
         face[face_layer] = 1
         anchor[edge_layer] = 1
         select(bm, anchor)
         return face
-    clear_pending(bm)
+    clear_pending(bm, discard=quad_only)
     if isinstance(anchor, bmesh.types.BMVert) and anchor != vertex:
         edge = bm.edges.get((anchor, vertex)) or bm.edges.new((anchor, vertex))
         select(bm, edge)
@@ -126,32 +170,28 @@ def extend(bm, anchor, vertex):
     return vertex
 
 
-def bridge(bm, source, target):
+def bridge(bm, source, target, quad_only=False):
     if source == target or len(source.link_faces) > 1 or len(target.link_faces) > 1:
         raise ValueError("Choose another boundary or loose edge")
-    a, b = oriented(source, sum((v.co for v in target.verts), target.verts[0].co * 0) / 2)
-    c, d = target.verts
-    shared = set(source.verts) & set(target.verts)
-    if shared:
-        verts = [a, b, next(v for v in target.verts if v not in shared)]
-    else:
-        if (b.co - d.co).length_squared + (a.co - c.co).length_squared < (b.co - c.co).length_squared + (a.co - d.co).length_squared:
-            c, d = d, c
-        verts = [a, b, c, d]
+    verts = bridge_verts(source, target)
+    if quad_only and len(verts) != 4:
+        raise ValueError("Quad-only mode needs four corners")
     check_face(bm, verts)
     # Adjacent existing faces must traverse a shared edge in opposite directions.
-    if target.link_faces:
-        loop = next(loop for loop in target.link_faces[0].loops if loop.edge == target)
-        pairs = list(zip(verts, verts[1:] + verts[:1]))
-        if (loop.vert, loop.link_loop_next.vert) in pairs:
-            raise ValueError("Target edge has incompatible face winding")
+    if has_target_winding_conflict(target, verts):
+        if not recalculate_face_normals(bm):
+            raise ValueError(WINDING_ERROR)
+        verts = bridge_verts(source, target)
+        check_face(bm, verts)
+        if has_target_winding_conflict(target, verts):
+            raise ValueError(WINDING_ERROR)
     face = bm.faces.new(verts)
     clear_pending(bm)
     select(bm, target)
     return face
 
 
-def connect_cut(bm, start, end):
+def connect_cut(bm, start, end, discard_pending=False):
     if start == end:
         select(bm, end)
         return end
@@ -167,14 +207,14 @@ def connect_cut(bm, start, end):
         result = edges
     else:
         result = bm.edges.new((start, end))
-    clear_pending(bm)
+    clear_pending(bm, discard=discard_pending)
     select(bm, end)
     return result
 
 
-def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, project=None):
+def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, project=None, quad_only=False):
     original = set(bm.verts) if project is not None else None
-    result = _apply_click(bm, anchor, hit, point, edge_factor, bridge_mode)
+    result = _apply_click(bm, anchor, hit, point, edge_factor, bridge_mode, quad_only)
     if project is not None:
         positions = [(v, project(v.co)) for v in bm.verts if v not in original]
         for vertex, position in positions:
@@ -182,34 +222,34 @@ def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False,
     return result
 
 
-def _apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False):
+def _apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, quad_only=False):
     if isinstance(hit, bmesh.types.BMEdge):
         if bridge_mode or (isinstance(anchor, bmesh.types.BMEdge) and anchor != hit):
             if not isinstance(anchor, bmesh.types.BMEdge):
                 raise ValueError("Select a starting edge to bridge")
             if pending(bm):
-                raise ValueError("Commit the triangle before bridging")
-            return bridge(bm, anchor, hit)
-        clear_pending(bm)
+                raise ValueError("Complete the quad before bridging" if quad_only else "Commit the triangle before bridging")
+            return bridge(bm, anchor, hit, quad_only)
+        clear_pending(bm, discard=quad_only)
         _, vertex = bmesh.utils.edge_split(hit, hit.verts[0], max(0.001, min(0.999, edge_factor)))
         if isinstance(anchor, bmesh.types.BMVert):
-            return connect_cut(bm, anchor, vertex)
+            return connect_cut(bm, anchor, vertex, quad_only)
         select(bm, vertex)
         return vertex
     if isinstance(hit, bmesh.types.BMVert) and isinstance(anchor, bmesh.types.BMVert):
-        return connect_cut(bm, anchor, hit)
+        return connect_cut(bm, anchor, hit, quad_only)
     if isinstance(hit, bmesh.types.BMVert) and isinstance(anchor, bmesh.types.BMEdge) and hit in anchor.verts:
-        clear_pending(bm)
+        clear_pending(bm, discard=quad_only)
         select(bm, hit)
         return hit
     if hit is None and point is None:
         raise ValueError("Cursor is outside the reference surface")
-    return extend(bm, anchor, hit if hit is not None else bm.verts.new(point))
+    return extend(bm, anchor, hit if hit is not None else bm.verts.new(point), quad_only)
 
 
-def merge_vertices(bm, source, target):
+def merge_vertices(bm, source, target, discard_pending=False):
     if source != target:
-        clear_pending(bm)
+        clear_pending(bm, discard=discard_pending)
         bmesh.ops.weld_verts(bm, targetmap={source: target})
     select(bm, target)
     return target
@@ -251,9 +291,9 @@ def loop_preview(edge, factor, project=None):
     return [points[e].copy() for pair in faces.values() for e in pair]
 
 
-def loop_cut(bm, edge, factor, project=None):
+def loop_cut(bm, edge, factor, project=None, discard_pending=False):
     starts, faces, points = loop_plan(edge, factor, project)
-    clear_pending(bm)
+    clear_pending(bm, discard=discard_pending)
     vertices = {e: bmesh.utils.edge_split(e, start, max(0.001, min(0.999, factor)))[1]
                 for e, start in starts.items()}
     cuts = []

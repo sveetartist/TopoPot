@@ -35,6 +35,10 @@ Shift-Alt-Q opens the Retopo Modes pie menu in Mesh Edit Mode, including while
 Box Select is active. Change its shortcut in Preferences > Add-ons > Retopo Pool.
 Enable Preserve Borders in the pie, sidebar, or brush tool settings to relax only
 interior surface vertices, leaving open borders and loose geometry fixed.
+Enable Quad Only in Retopo mode to reject shared-endpoint triangle bridges and
+discard pending triangle faces when selecting away, cutting, or deactivating.
+The first triangle in the normal strip workflow is still allowed as the temporary
+half of the next quad.
 
 In Brush mode, left-drag moves visible vertices inside the brush with a soft
 falloff. Hold Shift while dragging to relax geometry. Both operations snap to
