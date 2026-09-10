@@ -13,7 +13,7 @@ updating an already enabled older version.
 1. Select the mesh you want to edit in Object Mode. Open the 3D View sidebar
    with N, choose Retopo, and press Activate Retopo Pool. The selected mesh
    enters Edit Mode. With no mesh selected, activation creates an empty mesh.
-   Set Reference separately when you want projection onto another mesh.
+   Set Reference to a collection when you want projection onto its meshes.
 2. Ctrl-click empty space (or the Reference surface) to place a vertex.
    Ctrl-click again to create an edge.
 3. From a selected edge, Ctrl-click a third corner to create a triangle.
@@ -95,7 +95,8 @@ Esc/right-click during dragging restores the vertex position. Ctrl-Z uses
 Blender's normal undo history. Middle-mouse navigation and wheel zoom remain
 available. Deactivate returns to box selection.
 
-Reference projects onto the evaluated reference mesh, including its modifiers.
+Reference projects onto the closest evaluated mesh surface in the selected
+collection, including child collections and modifiers. The edited mesh is excluded.
 Offset is measured in world units. New-point clicks outside the reference do nothing.
 Edge subdivision and face cuts project newly inserted vertices onto Reference,
 including intermediate vertices created when cutting across multiple faces.

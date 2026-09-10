@@ -1,7 +1,7 @@
 bl_info = {
     "name": "TopoPot - Retopology tool for Blender",
     "author": "ArtVit",
-    "version": (1, 14, 12),
+    "version": (1, 16, 12),
     "blender": (5, 0, 0),
     "location": "3D View > Sidebar > TopoPot",
     "description": "Minimalistic retopology with quality tools. Cook your topology.",
@@ -106,8 +106,9 @@ class RP_Settings(bpy.types.PropertyGroup):
     preserve_borders: bpy.props.BoolProperty(name="Preserve Borders", description="Relax only interior surface vertices, keeping open borders and loose geometry fixed", default=False)
     mode: EnumProperty(name="Mode", items=(('RETOPO', "Retopo", "Create and move topology"), ('BRUSH', "Brush", "Move vertices; Shift relaxes"), ('BOX', "Box Select", "Blender's native box selection")), default='RETOPO', update=update_mode)
     quad_only: BoolProperty(name="Quad Mode", description="Extrude quads with the new edge centered at the cursor; allow triangles when connecting neighboring edges", default=False)
+    snapping: BoolProperty(name="Snapping", description="Snap to the reference surface and automatically merge nearby vertices", default=True)
     brush_radius: IntProperty(name="Brush Radius", default=75, min=5, max=500, subtype='PIXEL')
-    target: PointerProperty(name="Reference", description="Optional mesh used for surface projection", type=bpy.types.Object, poll=mesh_filter)
+    target: PointerProperty(name="Reference", description="Mesh objects in this collection and its child collections provide snapping surfaces", type=bpy.types.Collection)
     offset: FloatProperty(name="Offset", default=0.001, min=0, soft_max=0.1, subtype='DISTANCE')
     radius: IntProperty(name="Pick Radius", default=14, min=4, max=48, subtype='PIXEL')
     merge_radius: IntProperty(name="Merge Radius", description="Snap and merge a dragged vertex within this screen distance", default=10, min=3, max=32, subtype='PIXEL')
@@ -119,17 +120,13 @@ def project(context, mouse, depth):
     origin = view3d_utils.region_2d_to_origin_3d(region, rv3d, mouse)
     direction = view3d_utils.region_2d_to_vector_3d(region, rv3d, mouse)
     settings = context.scene.retopo_tool
-    target = settings.target
-    if target and target != context.edit_object:
-        evaluated = target.evaluated_get(context.evaluated_depsgraph_get())
-        matrix = evaluated.matrix_world
-        inverse = matrix.inverted_safe()
-        hit, location, normal, _ = evaluated.ray_cast(inverse @ origin, (inverse.to_3x3() @ direction).normalized())
-        if hit:
-            normal = (inverse.transposed().to_3x3() @ normal).normalized()
-            if normal.dot(direction) >= -1e-6:
-                return None
-            return matrix @ location + normal * settings.offset
+    if settings.snapping and settings.target:
+        tree = reference_tree(context)
+        if tree is None:
+            return None
+        location, normal, _, _ = tree.ray_cast(origin, direction)
+        if location is not None and normal.dot(direction) < -1e-6:
+            return location + normal * settings.offset
         return None
     return view3d_utils.region_2d_to_location_3d(region, rv3d, mouse, depth)
 
@@ -164,19 +161,40 @@ def invalidate_visibility(scene=None, depsgraph=None):
             del _visibility_cache[key]
 
 
+class ReferenceSurface:
+    """Query the closest hit across world-space mesh trees."""
+    def __init__(self, trees):
+        self.trees = trees
+
+    def ray_cast(self, origin, direction):
+        hits = [tree.ray_cast(origin, direction) for tree in self.trees]
+        return min((hit for hit in hits if hit[0] is not None),
+                   key=lambda hit: hit[3], default=(None, None, None, None))
+
+    def find_nearest(self, point):
+        hits = [tree.find_nearest(point) for tree in self.trees]
+        return min((hit for hit in hits if hit[0] is not None),
+                   key=lambda hit: hit[3], default=(None, None, None, None))
+
+
 def reference_tree(context):
-    reference = context.scene.retopo_tool.target
-    if reference is None or reference == context.edit_object:
+    collection = context.scene.retopo_tool.target
+    if collection is None:
         return None
-    def build():
-        evaluated = reference.evaluated_get(context.evaluated_depsgraph_get())
-        mesh = evaluated.to_mesh()
-        try:
-            return BVHTree.FromPolygons([evaluated.matrix_world @ v.co for v in mesh.vertices],
-                                       [tuple(p.vertices) for p in mesh.polygons])
-        finally:
-            evaluated.to_mesh_clear()
-    return cached_tree('reference', reference, build)
+    trees = []
+    for reference in collection.all_objects:
+        if reference.type != 'MESH' or reference == context.edit_object:
+            continue
+        def build():
+            evaluated = reference.evaluated_get(context.evaluated_depsgraph_get())
+            mesh = evaluated.to_mesh()
+            try:
+                return BVHTree.FromPolygons([evaluated.matrix_world @ v.co for v in mesh.vertices],
+                                           [tuple(p.vertices) for p in mesh.polygons])
+            finally:
+                evaluated.to_mesh_clear()
+        trees.append(cached_tree('reference', reference, build))
+    return ReferenceSurface(trees) if trees else None
 
 
 def visible_from_view(context, co, tree, tolerance=1e-5):
@@ -262,11 +280,15 @@ def placement(context, mouse, anchor):
 
 
 def reference_projector(context):
+    if not context.scene.retopo_tool.snapping:
+        return None
     reference = context.scene.retopo_tool.target
     obj = context.edit_object
-    if reference is None or reference == obj:
+    if reference is None:
         return None
     tree = reference_tree(context)
+    if tree is None:
+        return None
     matrix = obj.matrix_world.copy()
     inverse = matrix.inverted_safe()
     offset = context.scene.retopo_tool.offset
@@ -274,7 +296,7 @@ def reference_projector(context):
     def snap(co):
         location, normal, _, _ = tree.find_nearest(matrix @ co)
         if location is None:
-            raise ValueError("Reference mesh has no surface to snap to")
+            raise ValueError("Reference collection has no surface to snap to")
         screen = view3d_utils.location_3d_to_region_2d(context.region, context.region_data, location)
         if screen is None:
             return co.copy()
@@ -309,6 +331,8 @@ def edge_drag_positions(context, originals, start, mouse, snap=None):
 
 
 def quad_snap_distance(context):
+    if not context.scene.retopo_tool.snapping:
+        return None
     matrix = context.edit_object.matrix_world.copy()
     inverse = matrix.inverted_safe()
     def distance(co):
@@ -473,7 +497,7 @@ class RP_OT_click(bpy.types.Operator):
                 mouse = Vector((event.mouse_x - self.region.x, event.mouse_y - self.region.y))
                 with context.temp_override(area=self.area, region=self.region):
                     target = pick(context, bm, mouse, exclude=vertex, vertices_only=True,
-                                  radius=context.scene.retopo_tool.merge_radius)
+                                  radius=context.scene.retopo_tool.merge_radius) if context.scene.retopo_tool.snapping else None
                 if target is not None:
                     topology.merge_vertices(bm, vertex, target, context.scene.retopo_tool.quad_only)
                     sync(self.obj)
@@ -487,7 +511,7 @@ class RP_OT_click(bpy.types.Operator):
                 obj = self.obj
                 with context.temp_override(area=self.area, region=self.region):
                     target = pick(context, bm, mouse, exclude=vertex, vertices_only=True,
-                                  radius=context.scene.retopo_tool.merge_radius)
+                                  radius=context.scene.retopo_tool.merge_radius) if context.scene.retopo_tool.snapping else None
                     point = obj.matrix_world @ target.co if target is not None else project(context, mouse, obj.matrix_world @ self.original)
                 _merge_target = (self.region.as_pointer(), target.co.copy()) if target is not None else None
                 if point is not None:
@@ -847,8 +871,8 @@ class RP_Tool(bpy.types.WorkSpaceTool):
     bl_space_type = 'VIEW_3D'
     bl_context_mode = 'EDIT_MESH'
     bl_idname = "retopo_tool.tool"
-    bl_label = "Retopo tool"
-    bl_description = "Select and drag; Ctrl-click creates or cuts; Ctrl-Shift-click bridges edges"
+    bl_label = "TopoPot"
+    bl_description = "Select and drag; Ctrl-click creates or cuts or bridges edges"
     bl_icon = TOOL_ICON
     bl_keymap = (
         ("mesh.retopo_tool_brush", {"type": 'LEFTMOUSE', "value": 'PRESS', "any": True}, None),
@@ -863,6 +887,7 @@ class RP_Tool(bpy.types.WorkSpaceTool):
 
     def draw_settings(context, layout, tool):
         layout.prop(context.scene.retopo_tool, "mode", expand=True)
+        layout.prop(context.scene.retopo_tool, "snapping")
         if context.scene.retopo_tool.mode == 'BRUSH':
             layout.prop(context.scene.retopo_tool, "brush_radius")
             layout.prop(context.scene.retopo_tool, "preserve_borders")
@@ -897,8 +922,6 @@ class RP_OT_activate(bpy.types.Operator):
             obj.select_set(True)
             context.view_layer.objects.active = obj
             bpy.ops.object.mode_set(mode='EDIT')
-        if context.scene.retopo_tool.target == context.edit_object:
-            context.scene.retopo_tool.target = None
         context.tool_settings.mesh_select_mode = (True, False, False)
         bpy.ops.wm.tool_set_by_id(name='builtin.select_box' if context.scene.retopo_tool.mode == 'BOX' else RP_Tool.bl_idname)
         return {'FINISHED'}
@@ -918,11 +941,11 @@ class RP_OT_stop(bpy.types.Operator):
 
 
 class RP_PT_panel(bpy.types.Panel):
-    bl_label = "Retopo tool"
+    bl_label = "TopoPot - Retopology tool for Blender"
     bl_idname = "RP_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "Retopo"
+    bl_category = "TopoPot"
 
     def draw(self, context):
         layout = self.layout
@@ -933,6 +956,7 @@ class RP_PT_panel(bpy.types.Panel):
         layout.operator("mesh.retopo_tool_stop" if running else "mesh.retopo_tool_activate", icon='PAUSE' if running else 'PLAY')
         settings = context.scene.retopo_tool
         layout.prop(settings, "mode", expand=True)
+        layout.prop(settings, "snapping")
         if settings.mode == 'BRUSH':
             layout.prop(settings, "brush_radius")
             layout.prop(settings, "preserve_borders")
