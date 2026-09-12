@@ -1,11 +1,11 @@
-# Retopo Pool
+# TopoPot - Retopo Tool for Blender 
 
 Minimal retopology add-on for Blender 5.0.
 
 ## Install
 
 In Blender, open Edit > Preferences > Add-ons, use the menu's Install from Disk,
-and select `zips/retopo_pool-1.10.0.zip`. Enable Retopo Pool. Restart Blender after
+and select provided zip file. Enable TopoPot. Restart Blender after
 updating an already enabled older version.
 
 ## Use

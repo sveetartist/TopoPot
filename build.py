@@ -6,7 +6,7 @@ from zipfile import ZipFile, ZIP_DEFLATED
 
 
 root = Path(__file__).resolve().parent
-init_path = root / "retopo_tool" / "__init__.py"
+init_path = root / "topopot_retopo_tool" / "__init__.py"
 
 
 def get_addon_version(init_file: Path) -> str:
@@ -24,22 +24,22 @@ def get_addon_version(init_file: Path) -> str:
 
 version = get_addon_version(init_path)
 
-destination = root / "zips" / f"retopo_tool-{version}.zip"
+destination = root / "zips" / f"topopot_retopo_tool-{version}.zip"
 destination.parent.mkdir(parents=True, exist_ok=True)
 
 with ZipFile(destination, "w", ZIP_DEFLATED) as archive:
-    for path in sorted((root / "retopo_tool").glob("*.py")):
+    for path in sorted((root / "topopot_retopo_tool").glob("*.py")):
         archive.write(path, path.relative_to(root))
 
-    for path in sorted((root / "retopo_tool" / "assets").glob("*")):
+    for path in sorted((root / "topopot_retopo_tool" / "assets").glob("*")):
         if path.is_file():
             archive.write(path, path.relative_to(root))
 
-    archive.write(root / "README.md", "retopo_tool/README.md")
+    archive.write(root / "README.md", "topopot_retopo_tool/README.md")
 
 with ZipFile(destination) as archive:
     assert archive.testzip() is None
-    assert "retopo_tool/__init__.py" in archive.namelist()
-    assert "retopo_tool/assets/retopo_icon.dat" in archive.namelist()
+    assert "topopot_retopo_tool/__init__.py" in archive.namelist()
+    assert "topopot_retopo_tool/assets/retopo_icon.dat" in archive.namelist()
 
 print(destination)
