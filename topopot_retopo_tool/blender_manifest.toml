@@ -1,0 +1,10 @@
+schema_version = "1.0.0"
+id = "topopot_retopo_tool"
+version = "1.16.13"
+name = "TopoPot - Retopology tool for Blender"
+tagline = "Minimalistic retopology with quality tools"
+maintainer = "ArtVit"
+type = "add-on"
+tags = ["Mesh", "Modeling"]
+blender_version_min = "5.0.0"
+license = ["SPDX:GPL-3.0-or-later"]

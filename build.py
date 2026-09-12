@@ -1,45 +1,36 @@
-"""Create a clean legacy add-on ZIP installable through Install from Disk."""
+"""Build a Blender extension ZIP with Python 3.11 or newer."""
 
-import ast
+import tomllib
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 
 
 root = Path(__file__).resolve().parent
-init_path = root / "topopot_retopo_tool" / "__init__.py"
+source = root / "topopot_retopo_tool"
+manifest_path = source / "blender_manifest.toml"
 
 
-def get_addon_version(init_file: Path) -> str:
-    tree = ast.parse(init_file.read_text(encoding="utf-8"))
+with manifest_path.open("rb") as handle:
+    manifest = tomllib.load(handle)
+version = manifest["version"]
 
-    for node in tree.body:
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name) and target.id == "bl_info":
-                    bl_info = ast.literal_eval(node.value)
-                    return ".".join(map(str, bl_info["version"]))
-
-    raise RuntimeError("Could not find bl_info['version'] in __init__.py")
-
-
-version = get_addon_version(init_path)
-
-destination = root / "zips" / f"topopot_retopo_tool-{version}.zip"
+destination = root / "zips" / f"{manifest['id']}-{version}.zip"
 destination.parent.mkdir(parents=True, exist_ok=True)
 
 with ZipFile(destination, "w", ZIP_DEFLATED) as archive:
-    for path in sorted((root / "topopot_retopo_tool").glob("*.py")):
-        archive.write(path, path.relative_to(root))
+    archive.write(manifest_path, "blender_manifest.toml")
+    for path in sorted(source.glob("*.py")):
+        archive.write(path, path.relative_to(source))
 
-    for path in sorted((root / "topopot_retopo_tool" / "assets").glob("*")):
+    for path in sorted((source / "assets").rglob("*")):
         if path.is_file():
-            archive.write(path, path.relative_to(root))
+            archive.write(path, path.relative_to(source))
 
-    archive.write(root / "README.md", "topopot_retopo_tool/README.md")
+    archive.write(root / "README.md", "README.md")
 
 with ZipFile(destination) as archive:
     assert archive.testzip() is None
-    assert "topopot_retopo_tool/__init__.py" in archive.namelist()
-    assert "topopot_retopo_tool/assets/retopo_icon.dat" in archive.namelist()
+    assert {"blender_manifest.toml", "__init__.py", "topology.py",
+            "assets/retopo_icon.dat", "README.md"}.issubset(archive.namelist())
 
 print(destination)

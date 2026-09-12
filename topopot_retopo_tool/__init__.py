@@ -1,13 +1,3 @@
-bl_info = {
-    "name": "TopoPot - Retopology tool for Blender",
-    "author": "ArtVit",
-    "version": (1, 16, 12),
-    "blender": (5, 0, 0),
-    "location": "3D View > Sidebar > TopoPot",
-    "description": "Minimalistic retopology with quality tools. Cook your topology.",
-    "category": "Mesh",
-}
-
 import bpy
 import bmesh
 import gpu

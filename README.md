@@ -4,9 +4,27 @@ Minimal retopology add-on for Blender 5.0.
 
 ## Install
 
-In Blender, open Edit > Preferences > Add-ons, use the menu's Install from Disk,
-and select provided zip file. Enable TopoPot. Restart Blender after
-updating an already enabled older version.
+Requires Blender 5.0 or newer. Open Edit > Preferences > Get Extensions,
+use the menu's Install from Disk, and select the provided ZIP file. Enable TopoPot.
+When migrating from the legacy add-on, disable and remove the old TopoPot add-on
+first, then restart Blender and install the extension to avoid duplicate tools.
+
+## Package
+
+Run `python build.py` with Python 3.11 or newer. The extension ZIP is written to
+`zips/topopot_retopo_tool-<version>.zip`, with `blender_manifest.toml` and
+`__init__.py` at its root alongside the code, icon assets, and this README.
+Edit `topopot_retopo_tool/blender_manifest.toml` to update the version or metadata.
+
+Validate the resulting archive using Blender's official validator:
+
+```sh
+blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.16.13.zip
+```
+
+## License
+
+GPL-3.0-or-later (GNU General Public License version 3 or any later version).
 
 ## Use
 
