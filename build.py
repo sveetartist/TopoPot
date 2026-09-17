@@ -1,19 +1,36 @@
-"""Create a clean legacy add-on ZIP installable through Install from Disk."""
+"""Build a Blender extension ZIP with Python 3.11 or newer."""
+
+import tomllib
 from pathlib import Path
 from zipfile import ZipFile, ZIP_DEFLATED
 
+
 root = Path(__file__).resolve().parent
-destination = root / "zips" / "retopo_pool-1.8.0.zip"
+source = root / "topopot_retopo_tool"
+manifest_path = source / "blender_manifest.toml"
+
+
+with manifest_path.open("rb") as handle:
+    manifest = tomllib.load(handle)
+version = manifest["version"]
+
+destination = root / "zips" / f"{manifest['id']}-{version}.zip"
 destination.parent.mkdir(parents=True, exist_ok=True)
+
 with ZipFile(destination, "w", ZIP_DEFLATED) as archive:
-    for path in sorted((root / "retopo_pool").glob("*.py")):
-        archive.write(path, path.relative_to(root))
-    for path in sorted((root / "retopo_pool" / "assets").glob("*")):
+    archive.write(manifest_path, "blender_manifest.toml")
+    for path in sorted(source.glob("*.py")):
+        archive.write(path, path.relative_to(source))
+
+    for path in sorted((source / "assets").rglob("*")):
         if path.is_file():
-            archive.write(path, path.relative_to(root))
-    archive.write(root / "README.md", "retopo_pool/README.md")
+            archive.write(path, path.relative_to(source))
+
+    archive.write(root / "README.md", "README.md")
+
 with ZipFile(destination) as archive:
     assert archive.testzip() is None
-    assert "retopo_pool/__init__.py" in archive.namelist()
-    assert "retopo_pool/assets/retopo_icon.dat" in archive.namelist()
+    assert {"blender_manifest.toml", "__init__.py", "topology.py",
+            "assets/retopo_icon.dat", "README.md"}.issubset(archive.namelist())
+
 print(destination)

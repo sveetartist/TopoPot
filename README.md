@@ -1,19 +1,37 @@
-# Retopo Pool
+# TopoPot - Retopo Tool for Blender 
 
 Minimal retopology add-on for Blender 5.0.
 
 ## Install
 
-In Blender, open Edit > Preferences > Add-ons, use the menu's Install from Disk,
-and select `zips/retopo_pool-1.8.0.zip`. Enable Retopo Pool. Restart Blender after
-updating an already enabled older version.
+Requires Blender 5.0 or newer. Open Edit > Preferences > Get Extensions,
+use the menu's Install from Disk, and select the provided ZIP file. Enable TopoPot.
+When migrating from the legacy add-on, disable and remove the old TopoPot add-on
+first, then restart Blender and install the extension to avoid duplicate tools.
+
+## Package
+
+Run `python build.py` with Python 3.11 or newer. The extension ZIP is written to
+`zips/topopot_retopo_tool-<version>.zip`, with `blender_manifest.toml` and
+`__init__.py` at its root alongside the code, icon assets, and this README.
+Edit `topopot_retopo_tool/blender_manifest.toml` to update the version or metadata.
+
+Validate the resulting archive using Blender's official validator:
+
+```sh
+blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.16.13.zip
+```
+
+## License
+
+GPL-3.0-or-later (GNU General Public License version 3 or any later version).
 
 ## Use
 
 1. Select the mesh you want to edit in Object Mode. Open the 3D View sidebar
    with N, choose Retopo, and press Activate Retopo Pool. The selected mesh
    enters Edit Mode. With no mesh selected, activation creates an empty mesh.
-   Set Reference separately when you want projection onto another mesh.
+   Set Reference to a collection when you want projection onto its meshes.
 2. Ctrl-click empty space (or the Reference surface) to place a vertex.
    Ctrl-click again to create an edge.
 3. From a selected edge, Ctrl-click a third corner to create a triangle.
@@ -27,6 +45,27 @@ updating an already enabled older version.
   Finish or commit a pending triangle before bridging.
 
 ## Cuts and Subdivision
+
+Choose Retopo, Brush, or Box Select in the Retopo sidebar. Box Select activates
+Blender's native selection tool, including its normal modifier and X-Ray behavior.
+Choose Retopo or Brush in the sidebar to return from box selection.
+Shift-Alt-Q opens the Retopo Modes pie menu in Mesh Edit Mode, including while
+Box Select is active. Change its shortcut in Preferences > Add-ons > Retopo Pool.
+Enable Preserve Borders in the pie, sidebar, or brush tool settings to relax only
+interior surface vertices, leaving open borders and loose geometry fixed.
+Enable Prefer Quad in Retopo mode to extrude quads while allowing triangle
+connections between neighboring edges that share a vertex.
+Each click away from the active edge extrudes a complete quad, with the new edge
+centered at the cursor and selected for the next extrusion. Clicking an existing
+vertex snaps one new corner to it; clicking another boundary edge bridges to it.
+New corners also snap automatically to existing vertices within four times Merge Radius.
+
+In Brush mode, left-drag moves visible vertices inside the brush with a soft
+falloff. Hold Shift while dragging to relax geometry. Both operations snap to
+Reference when set. Press F and move the mouse horizontally to adjust the brush
+radius; left-click confirms and Esc/right-click cancels the size change.
+Esc/right-click during a brush stroke restores the original vertex positions.
+Brush strokes support normal undo and do not merge vertices.
 
 - Ctrl-left-drag an edge to preview a loop cut through its connected quad strip.
   New loop vertices snap to the nearest evaluated Reference surface with Offset;
@@ -74,7 +113,8 @@ Esc/right-click during dragging restores the vertex position. Ctrl-Z uses
 Blender's normal undo history. Middle-mouse navigation and wheel zoom remain
 available. Deactivate returns to box selection.
 
-Reference projects onto the evaluated reference mesh, including its modifiers.
+Reference projects onto the closest evaluated mesh surface in the selected
+collection, including child collections and modifiers. The edited mesh is excluded.
 Offset is measured in world units. New-point clicks outside the reference do nothing.
 Edge subdivision and face cuts project newly inserted vertices onto Reference,
 including intermediate vertices created when cutting across multiple faces.
