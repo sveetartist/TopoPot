@@ -122,7 +122,7 @@ def recalculate_face_normals(bm):
     return True
 
 
-def extrude_quad(bm, anchor, point, target=None):
+def extrude_quad(bm, anchor, point, target=None, project=None, finalize=True):
     """Place the new edge's midpoint at point, or snap one corner to target."""
     if len(anchor.link_faces) > 1:
         raise ValueError("Start from a boundary or loose edge")
@@ -163,6 +163,9 @@ def extrude_quad(bm, anchor, point, target=None):
             d = target
             c = bm.verts.new(b.co + target.co - a.co)
             created.append(c)
+        if project is not None:
+            for vertex in created:
+                vertex.co = project(vertex.co)
         check_face(bm, [a, b, c, d])
         face = bm.faces.new((a, b, c, d))
     except Exception:
@@ -174,9 +177,68 @@ def extrude_quad(bm, anchor, point, target=None):
         source = next((f for f in anchor.link_faces if f != face), None)
         if source is not None:
             face.material_index = source.material_index
-    clear_pending(bm)
-    select(bm, bm.edges.get((c, d)))
+    if finalize:
+        clear_pending(bm)
+        select(bm, bm.edges.get((c, d)))
     return face
+
+
+class StripPath:
+    """Resample a cursor polyline at the starting edge's width."""
+    def __init__(self, start, spacing):
+        if spacing <= 1e-8:
+            raise ValueError("The starting edge is too short")
+        self.spacing = spacing
+        self.cursor = start.copy()
+        self.remaining = spacing
+        self.points = []
+
+    def add(self, point):
+        start = self.cursor
+        delta = point - start
+        length = delta.length
+        if length <= 1e-10:
+            return
+        direction = delta / length
+        while length >= self.remaining:
+            start = start + direction * self.remaining
+            self.points.append(start.copy())
+            length -= self.remaining
+            self.remaining = self.spacing
+        self.remaining -= length
+        self.cursor = point.copy()
+
+    def positions(self):
+        points = [point.copy() for point in self.points]
+        # Avoid a tiny final face when release is very close to a sample.
+        if self.spacing - self.remaining > self.spacing * 0.1:
+            if not points or (points[-1] - self.cursor).length > self.spacing * 0.1:
+                points.append(self.cursor.copy())
+        return points
+
+
+def quad_strip(bm, anchor, points, project=None):
+    """Extrude a whole stroke, rolling back geometry if any quad is invalid."""
+    if not isinstance(anchor, bmesh.types.BMEdge) or anchor.hide or len(anchor.link_faces) > 1:
+        raise ValueError("Select a boundary or loose edge to draw a strip")
+    original = set(bm.verts)
+    faces = []
+    edge = anchor
+    try:
+        for point in points:
+            face = extrude_quad(bm, edge, point, project=project, finalize=False)
+            faces.append(face)
+            corners = list(face.verts)
+            edge = bm.edges.get((corners[2], corners[3]))
+    except Exception:
+        created = [v for v in bm.verts if v not in original]
+        if created:
+            bmesh.ops.delete(bm, geom=created, context='VERTS')
+        raise
+    if faces:
+        clear_pending(bm)
+        select(bm, edge)
+    return faces
 
 
 def extend(bm, anchor, vertex, quad_only=False):

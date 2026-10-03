@@ -375,6 +375,17 @@ def sync(obj, destructive=True):
     bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=destructive)
 
 
+def strip_preview(bm, edge, points, snap=None):
+    copy = bm.copy()
+    try:
+        copy.edges.ensure_lookup_table()
+        source = copy.edges[list(bm.edges).index(edge)]
+        faces = topology.quad_strip(copy, source, points, snap)
+        return [[v.co.copy() for v in face.verts] for face in faces]
+    finally:
+        copy.free()
+
+
 class RP_OT_click(bpy.types.Operator):
     bl_idname = "mesh.retopo_tool_click"
     bl_label = "Retopo tool Stroke"
@@ -393,6 +404,25 @@ class RP_OT_click(bpy.types.Operator):
         hit = pick(context, bm, mouse)
         anchor = topology.active(bm)
         settings = context.scene.retopo_tool
+        if (event.ctrl and not event.shift and isinstance(anchor, bmesh.types.BMEdge)
+                and len(anchor.link_faces) <= 1 and (hit is None or hit == anchor)):
+            bm.edges.index_update()
+            self.edge_index = anchor.index
+            self.obj, self.area, self.region = obj, context.area, context.region
+            self.start = mouse
+            self.dragging = False
+            self.strip_gesture = True
+            self.strip_on_edge = hit == anchor
+            try:
+                self.strip_path = topology.StripPath(
+                    (anchor.verts[0].co + anchor.verts[1].co) * 0.5, anchor.calc_length())
+            except ValueError as error:
+                self.report({'WARNING'}, str(error))
+                return {'CANCELLED'}
+            self.strip_snap = reference_projector(context)
+            self.strip_counts = (len(bm.verts), len(bm.edges), len(bm.faces))
+            context.window_manager.modal_handler_add(self)
+            return {'RUNNING_MODAL'}
         if event.ctrl and isinstance(hit, bmesh.types.BMVert):
             bm.verts.index_update()
             self.vertex_index = hit.index
@@ -461,6 +491,8 @@ class RP_OT_click(bpy.types.Operator):
 
     def modal(self, context, event):
         global _merge_target
+        if getattr(self, 'strip_gesture', False):
+            return RP_OT_click.modal_strip(self, context, event)
         if getattr(self, 'move_edge', False):
             return RP_OT_click.modal_move_edge(self, context, event)
         if getattr(self, 'connect_gesture', False):
@@ -508,6 +540,71 @@ class RP_OT_click(bpy.types.Operator):
                     vertex.co = obj.matrix_world.inverted_safe() @ point
                     sync(obj, destructive=False)
             context.area.tag_redraw()
+        return {'RUNNING_MODAL'}
+
+    def modal_strip(self, context, event):
+        global _strip_preview
+        if (context.mode != 'EDIT_MESH' or context.edit_object != self.obj
+                or context.scene.retopo_tool.mode != 'RETOPO'
+                or event.type in {'ESC', 'RIGHTMOUSE'}):
+            _strip_preview = None
+            self.area.tag_redraw()
+            return {'CANCELLED'}
+        release = event.type == 'LEFTMOUSE' and event.value == 'RELEASE'
+        if event.type not in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'} and not release:
+            return {'RUNNING_MODAL'}
+        bm = bmesh.from_edit_mesh(self.obj.data)
+        bm.edges.ensure_lookup_table()
+        if ((len(bm.verts), len(bm.edges), len(bm.faces)) != self.strip_counts
+                or self.edge_index >= len(bm.edges)):
+            _strip_preview = None
+            self.area.tag_redraw()
+            return {'CANCELLED'}
+        edge = bm.edges[self.edge_index]
+        mouse = Vector((event.mouse_x - self.region.x, event.mouse_y - self.region.y))
+        was_dragging = self.dragging
+        self.dragging |= (mouse - self.start).length > 4
+        try:
+            with context.temp_override(area=self.area, region=self.region):
+                track_mouse(context, event)
+                if self.dragging:
+                    # Empty-space presses are the first point of the drawn path.
+                    samples = [self.start, mouse] if not was_dragging and not self.strip_on_edge else [mouse]
+                    for sample in samples:
+                        point = placement(context, sample, edge)
+                        if point is None:
+                            raise ValueError("Cursor is outside the reference surface")
+                        self.strip_path.add(self.obj.matrix_world.inverted_safe() @ point)
+                    points = self.strip_path.positions()
+                    polygons = strip_preview(bm, edge, points, self.strip_snap)
+                    _strip_preview = (self.region.as_pointer(), polygons)
+                    if release:
+                        if not polygons:
+                            raise ValueError("Drag farther from the starting edge to draw a strip")
+                        topology.quad_strip(bm, edge, points, self.strip_snap)
+                        sync(self.obj)
+                elif release:
+                    hit = edge if self.strip_on_edge else None
+                    point = placement(context, self.start, edge) if hit is None else None
+                    point = self.obj.matrix_world.inverted_safe() @ point if point is not None else None
+                    factor = edge_parameter(context, edge, self.start) if hit is not None else 0.5
+                    settings = context.scene.retopo_tool
+                    preview(bm, edge, hit, point, factor, strict=True, project=self.strip_snap,
+                            quad_only=settings.quad_only, snap_distance=quad_snap_distance(context))
+                    topology.apply_click(bm, edge, hit, point, factor, project=self.strip_snap,
+                                         quad_only=settings.quad_only, snap_distance=quad_snap_distance(context))
+                    sync(self.obj)
+        except ValueError as error:
+            _strip_preview = (self.region.as_pointer(), [])
+            if release:
+                self.report({'WARNING'}, str(error))
+                _strip_preview = None
+                self.area.tag_redraw()
+                return {'CANCELLED'}
+        self.area.tag_redraw()
+        if release:
+            _strip_preview = None
+            return {'FINISHED'}
         return {'RUNNING_MODAL'}
 
     def modal_move_edge(self, context, event):
@@ -632,6 +729,7 @@ class RP_OT_click(bpy.types.Operator):
 
 _mouse_region = None
 _loop_preview = None
+_strip_preview = None
 _merge_target = None
 
 
@@ -862,7 +960,7 @@ class RP_Tool(bpy.types.WorkSpaceTool):
     bl_context_mode = 'EDIT_MESH'
     bl_idname = "retopo_tool.tool"
     bl_label = "TopoPot"
-    bl_description = "Select and drag; Ctrl-click creates or cuts or bridges edges"
+    bl_description = "Select and drag; Ctrl-click creates, cuts or bridges; Ctrl-drag from a selected boundary edge draws a quad strip"
     bl_icon = TOOL_ICON
     bl_keymap = (
         ("mesh.retopo_tool_brush", {"type": 'LEFTMOUSE', "value": 'PRESS', "any": True}, None),
@@ -990,7 +1088,9 @@ def draw_hover():
     kind = 'POINTS'
     preview_color = retopo_color(context)
     snapped_points = []
-    if _loop_preview is not None and _loop_preview[0] == context.region.as_pointer():
+    if _strip_preview is not None and _strip_preview[0] == context.region.as_pointer():
+        kind, polygons = 'STRIP', _strip_preview[1]
+    elif _loop_preview is not None and _loop_preview[0] == context.region.as_pointer():
         kind, polygons = 'LINES', _loop_preview[1]
     elif context.window_manager.retopo_tool_ctrl:
         anchor = topology.active(bm)
@@ -1015,8 +1115,15 @@ def draw_hover():
     gpu.state.point_size_set(9)
     gpu.state.line_width_set(3)
     try:
-        points = screen(polygons)
-        if kind == 'FACE' and len(points) >= 3:
+        points = [] if kind == 'STRIP' else screen(polygons)
+        if kind == 'STRIP':
+            for polygon in polygons:
+                outline = screen(polygon)
+                if len(outline) == 4:
+                    draw('TRIS', [outline[i] for i in (0, 1, 2, 0, 2, 3)],
+                         (*preview_color[:3], preview_color[3] * 0.25))
+                    draw('LINE_STRIP', outline + [outline[0]], preview_color)
+        elif kind == 'FACE' and len(points) >= 3:
             triangles = [points[i] for i in ((0, 1, 2) if len(points) == 3 else (0, 1, 2, 0, 2, 3))]
             draw('TRIS', triangles, (*preview_color[:3], preview_color[3] * 0.25))
             draw('LINE_STRIP', points + [points[0]], preview_color)

@@ -19,7 +19,7 @@ Edit `topopot_retopo_tool/blender_manifest.toml` to update the version or metada
 Validate the resulting archive using Blender's official validator:
 
 ```sh
-blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.16.13.zip
+blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.17.0.zip
 ```
 
 ## License
@@ -44,6 +44,21 @@ GPL-3.0-or-later (GNU General Public License version 3 or any later version).
    with a shared endpoint form a triangle; separate edges form a quad.
   Finish or commit a pending triangle before bridging.
 
+## Drawing Face Strips
+
+In Retopo mode, select a loose or boundary edge, then hold Ctrl and left-drag
+from the middle of that edge or from empty space to draw a strip of quads.
+The strip follows the dragged path, turns with the stroke, and uses the starting
+edge's width for face spacing. This works with Quad Mode enabled or disabled.
+With Snapping enabled and a Reference collection set, new corners project onto
+the reference surface with Offset. The starting edge stays in place.
+
+The faces preview while dragging. Release the left mouse button to create the
+strip in one undo step; its final outer edge becomes selected for the next stroke.
+Press Esc or right-click to cancel without changing the mesh. Invalid or folded
+strips are rejected. A Ctrl-click without dragging keeps the existing click action.
+Ctrl-dragging an interior edge, or an unselected edge, still previews a loop cut.
+
 ## Cuts and Subdivision
 
 Choose Retopo, Brush, or Box Select in the Retopo sidebar. Box Select activates
@@ -67,7 +82,7 @@ radius; left-click confirms and Esc/right-click cancels the size change.
 Esc/right-click during a brush stroke restores the original vertex positions.
 Brush strokes support normal undo and do not merge vertices.
 
-- Ctrl-left-drag an edge to preview a loop cut through its connected quad strip.
+- Ctrl-left-drag an interior or unselected edge to preview a loop cut through its connected quad strip.
   New loop vertices snap to the nearest evaluated Reference surface with Offset;
   the preview uses the same snapped positions. Without Reference they stay on
   the edited edges. Existing vertices are not moved.
@@ -75,7 +90,8 @@ Brush strokes support normal undo and do not merge vertices.
   Esc or right-click cancels without changing the mesh. The cut stops at
   boundaries, non-quad faces, hidden geometry, and non-manifold edges.
 - A Ctrl-click without dragging subdivides the clicked edge on release unless
-  a different edge is selected, in which case it bridges. Ctrl-drag still cuts a loop.
+  a different edge is selected, in which case it bridges. Ctrl-drag cuts a loop
+  unless it starts from the selected boundary or loose edge, which draws a face strip.
 
 - Ctrl-click an edge to insert a vertex at the cursor position. Adjacent faces
   retain their surface and gain the inserted corner.
@@ -97,7 +113,8 @@ Left-click selects a vertex or edge; drag a vertex to move it on the surface.
 Left-drag the middle of an edge to move both endpoints together. Endpoints snap
 to Reference when set; without Reference the edge translates in the view plane.
 Release to confirm, or Esc/right-click to restore both endpoints. Edge dragging
-does not auto-merge vertices. Ctrl-drag on an edge remains the loop-cut gesture.
+does not auto-merge vertices. Ctrl-drag on the selected boundary or loose edge
+draws a face strip; on interior or unselected edges it remains the loop-cut gesture.
 Dragging within Merge Radius of another visible vertex snaps to that vertex and
 highlights it in amber. Release to weld the dragged vertex into the target,
 preserving the target position and joining the topology. Esc/right-click restores
@@ -153,3 +170,5 @@ Run `blender --background --factory-startup --python-exit-code 1 --python tests/
 Tests cover registration, selected-mesh activation, projection, dragging,
 progressive strips, bridges, edge subdivision, cuts across faces, previews,
 crossed-quad rejection, and persistence of pending topology in mesh data.
+Ctrl-drag tests cover curved face strips, event-independent spacing, projection,
+release, cancellation, selection, rollback of invalid strokes, and click compatibility.
