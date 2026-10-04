@@ -1,10 +1,12 @@
 import sys
+sys.dont_write_bytecode = True
 import importlib
 from pathlib import Path
 import unittest
 from unittest.mock import patch
 from types import SimpleNamespace
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
+from math import cos, sin, tau
 
 import bpy
 import bmesh
@@ -18,6 +20,8 @@ from topopot_retopo_tool import topology as t
 class TopologyTests(unittest.TestCase):
     def setUp(self):
         retopo_tool.invalidate_visibility()
+        retopo_tool._strip_preview = None
+        retopo_tool._strip_target = None
         self.bm = bmesh.new()
 
     def tearDown(self):
@@ -26,12 +30,484 @@ class TopologyTests(unittest.TestCase):
     def v(self, x, y):
         return self.bm.verts.new((x, y, 0))
 
-    def strip_setup(self, start=(0, 0), on_edge=True, snap=None):
+    def hole_ring(self, count=8, center=(0, 0), reverse=False):
+        inner = [self.v(center[0] + cos(tau * i / count), center[1] + sin(tau * i / count)) for i in range(count)]
+        outer = [self.v(center[0] + 2 * cos(tau * i / count), center[1] + 2 * sin(tau * i / count)) for i in range(count)]
+        for i in range(count):
+            verts = [outer[i], outer[(i + 1) % count], inner[(i + 1) % count], inner[i]]
+            face = self.bm.faces.new(verts[::-1] if reverse else verts)
+            face.material_index = 2
+        return inner
+
+    def grid_context(self):
+        headers = []
+        region = SimpleNamespace(x=0, y=0, type='WINDOW', width=400, height=400, as_pointer=lambda: 321)
+        return SimpleNamespace(mode='EDIT_MESH',
+            edit_object=SimpleNamespace(data=None, matrix_world=Matrix.Identity(4)),
+            area=SimpleNamespace(type='VIEW_3D', tag_redraw=lambda: None, header_text_set=headers.append, headers=headers),
+            region=region, region_data=SimpleNamespace(perspective_matrix=Matrix.Identity(4)),
+            scene=SimpleNamespace(retopo_tool=SimpleNamespace(mode='GRID', target=None, snapping=True,
+                offset=0.001, reference_tolerance=12, quad_only=False)), window_manager=SimpleNamespace())
+
+    def hole_polygon(self, coords, center=(0.5, 0.5)):
+        rim = [self.v(x, y) for x, y in coords]
+        outer = [self.v(center[0] + (x - center[0]) * 1.5, center[1] + (y - center[1]) * 1.5) for x, y in coords]
+        for i in range(len(rim)):
+            following = (i + 1) % len(rim)
+            face = self.bm.faces.new((outer[i], outer[following], rim[following], rim[i]))
+            face.material_index = 5
+            face.smooth = True
+        return rim
+
+    def test_fill_hole_defaults_to_quads_independently_of_retopo_setting(self):
+        retopo_tool.register()
+        try:
+            self.assertFalse(bpy.context.scene.retopo_tool.quad_only)
+            self.assertTrue(retopo_tool.fill_quads_only(bpy.context))
+            self.assertEqual(bpy.context.scene.retopo_tool.bl_rna.properties['mode'].enum_items['GRID'].name, 'Fill Hole')
+        finally:
+            retopo_tool.unregister()
+
+    def test_fill_hole_mixed_fills_odd_and_triangular_holes(self):
+        for count in (3, 5, 7, 9):
+            with self.subTest(count=count):
+                self.bm.clear()
+                rim = self.hole_ring(count=count)
+                original = {v: v.co.copy() for v in self.bm.verts}
+                predicted = retopo_tool.grid_preview(self.bm, rim)
+                faces = t.fill_hole(self.bm, rim)
+                self.assertEqual(predicted, [[v.co for v in f.verts] for f in faces])
+                self.assertTrue(all(len(f.verts) in {3, 4} for f in faces))
+                self.assertTrue(any(len(f.verts) == 3 for f in faces))
+                self.assertEqual(original, {v: v.co for v in original})
+                self.assertTrue(all(len(self.bm.edges.get((a, b)).link_faces) == 2 for a, b in zip(rim, rim[1:] + rim[:1])))
+                self.bm.normal_update()
+                self.assertTrue(all(f.normal.z > 0 for f in faces))
+
+    def test_fill_hole_mixed_fills_concave_and_non_square_boundaries(self):
+        cases = [([(0, 0), (3, 0), (3, 1), (1, 1), (1, 3), (0, 3)], 5),
+                 ([(0, 0), (2, 0), (4, 0), (4, 1), (1, 1), (1, 3), (0, 3), (0, 1)], 6),
+                 ([(0, 0), (3, 0), (3, 3), (1.5, 1), (0, 3)], 6)]
+        for coords, area in cases:
+            with self.subTest(coords=coords):
+                self.bm.clear()
+                rim = self.hole_polygon(coords)
+                originals = {v: v.co.copy() for v in self.bm.verts}
+                predicted = retopo_tool.grid_preview(self.bm, rim)
+                faces = t.fill_hole(self.bm, rim)
+                self.assertEqual(predicted, [[v.co for v in f.verts] for f in faces])
+                self.assertAlmostEqual(sum(f.calc_area() for f in faces), area, places=5)
+                self.assertTrue(all(len(f.verts) in {3, 4} and f.material_index == 5 and f.smooth for f in faces))
+                self.assertEqual(originals, {v: v.co for v in originals})
+                self.assertTrue(all(len(e.link_faces) <= 2 for e in self.bm.edges))
+
+    def test_fill_hole_mixed_minimizes_triangles_on_odd_rims(self):
+        for count in (5, 7, 9, 11, 15):
+            with self.subTest(count=count):
+                self.bm.clear()
+                rim = self.hole_ring(count=count)
+                faces = t.fill_hole(self.bm, rim, quad_only=False)
+                self.assertEqual(sum(len(face.verts) == 3 for face in faces), 1)
+                self.assertEqual(sum(len(face.verts) == 4 for face in faces), (count - 3) // 2)
+
+    def test_fill_hole_mixed_concave_even_rim_uses_quads_without_triangles(self):
+        rim = self.hole_polygon([(0, 0), (3, 0), (3, 1), (1, 1), (1, 3), (0, 3)])
+        faces = t.fill_hole(self.bm, rim, quad_only=False)
+        self.assertEqual(len(faces), 2)
+        self.assertTrue(all(len(face.verts) == 4 for face in faces))
+        self.assertAlmostEqual(sum(face.calc_area() for face in faces), 5)
+
+    def test_fill_hole_mixed_uses_triangles_instead_of_sliver_quad(self):
+        rim = self.hole_polygon([(0, 0), (4, 0), (4, 0.01), (0, 1)])
+        faces = t.fill_hole(self.bm, rim, quad_only=False)
+        self.assertEqual(len(faces), 2)
+        self.assertTrue(all(len(face.verts) == 3 for face in faces))
+        self.assertAlmostEqual(sum(face.calc_area() for face in faces), 2.02, places=5)
+
+    def test_fill_hole_large_rim_is_mostly_quads_without_touching_boundary(self):
+        for count in (64, 65):
+            with self.subTest(count=count):
+                self.bm.clear()
+                rim = self.hole_ring(count=count)
+                original = {v: v.co.copy() for v in self.bm.verts}
+                snap = lambda co: Vector((co.x, co.y, 0.1))
+                predicted = retopo_tool.grid_preview(self.bm, rim, snap, quad_only=False)
+                faces = t.fill_hole(self.bm, rim, snap, quad_only=False)
+                self.assertEqual(predicted, [[v.co for v in f.verts] for f in faces])
+                self.assertGreater(sum(len(f.verts) == 4 for f in faces), len(faces) * 0.9)
+                self.assertEqual(original, {v: v.co for v in original})
+                self.assertTrue(all(len(e.link_faces) <= 2 for e in self.bm.edges))
+                self.assertTrue(all(abs(v.co.z - 0.1) < 1e-6 for v in self.bm.verts if v not in original))
+
+    def test_fill_hole_triangle_pairing_avoids_greedy_stranded_triangles(self):
+        rim = [self.v(x, y) for x, y in [(0, 0), (1, 0), (2, 0), (2, 1), (1, 1), (0, 1)]]
+        faces = [self.bm.faces.new([rim[i] for i in indices])
+                 for indices in [(0, 1, 5), (1, 4, 5), (1, 2, 4), (2, 3, 4)]]
+        t._pair_fill_triangles(self.bm, rim, faces)
+        self.assertEqual(len(self.bm.faces), 2)
+        self.assertTrue(all(len(face.verts) == 4 for face in self.bm.faces))
+        self.assertAlmostEqual(sum(face.calc_area() for face in self.bm.faces), 2)
+
+    def test_fill_hole_click_requires_ctrl_for_odd_rim(self):
+        self.front_view()
+        rim = self.hole_ring(count=9)
+        context = self.grid_context()
+        context.scene.retopo_tool.quad_only = True
+        reports = []
+        op = SimpleNamespace(report=lambda level, message: reports.append(message))
+        event = self.strip_event('LEFTMOUSE', (0, 0), 'PRESS', ctrl=False)
+        counts = len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)
+        with patch.object(retopo_tool.bmesh, 'from_edit_mesh', return_value=self.bm), patch.object(retopo_tool, 'sync'):
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.invoke(op, context, event), {'CANCELLED'})
+            self.assertEqual(counts, (len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)))
+            self.assertIn('even number', reports[-1])
+            event.ctrl = True
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.invoke(op, context, event), {'FINISHED'})
+        added = [face for face in self.bm.faces if face.select]
+        self.assertEqual(sum(len(face.verts) == 3 for face in added), 1)
+        self.assertEqual(sum(len(face.verts) == 4 for face in added), 3)
+        self.assertTrue(context.scene.retopo_tool.quad_only)
+
+    def test_fill_hole_mixed_hover_preview_and_click_irregular_hole(self):
+        self.front_view()
+        rim = self.hole_polygon([(0, 0), (3, 0), (3, 3), (1.5, 1), (0, 3)])
+        context = self.grid_context()
+        context.window_manager.retopo_tool_ctrl = True
+        mouse = Vector((1.5, 0.5))
+        self.assertEqual(set(retopo_tool.hole_at_mouse(context, self.bm, mouse)), set(rim))
+        polygons, border, error = retopo_tool.grid_hover_preview(context, self.bm, mouse)
+        self.assertIsNone(error)
+        self.assertTrue(any(len(polygon) == 3 for polygon in polygons))
+        self.assertEqual(len(self.bm.faces), 5)
+        event = self.strip_event('MOUSEMOVE', mouse, ctrl=True)
+        with patch.object(retopo_tool.bmesh, 'from_edit_mesh', return_value=self.bm):
+            retopo_tool.RP_OT_hover.invoke(None, context, event)
+        self.assertIn('Fill Hole | Quad/Tri', context.area.headers[-1])
+        self.assertIn('triangles', context.area.headers[-1])
+        event.type, event.value = 'LEFTMOUSE', 'PRESS'
+        with patch.object(retopo_tool.bmesh, 'from_edit_mesh', return_value=self.bm), \
+             patch.object(retopo_tool, 'sync'):
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.invoke(SimpleNamespace(report=lambda *args: None), context, event), {'FINISHED'})
+        self.assertEqual(len(self.bm.faces), 5 + len(polygons))
+
+    def test_fill_hole_ctrl_press_and_release_update_stationary_preview(self):
+        self.front_view()
+        self.hole_ring(count=7)
+        context = self.grid_context()
+        event = self.strip_event('LEFT_CTRL', (0, 0), 'PRESS', ctrl=False)
+        with patch.object(retopo_tool.bmesh, 'from_edit_mesh', return_value=self.bm):
+            retopo_tool.RP_OT_hover.invoke(None, context, event)
+        polygons, _, error = retopo_tool.grid_hover_preview(context, self.bm, Vector((0, 0)))
+        self.assertTrue(polygons)
+        self.assertIsNone(error)
+        self.assertIn('Quad/Tri (Ctrl)', context.area.headers[-1])
+        event.type, event.value, event.ctrl = 'RIGHT_CTRL', 'RELEASE', True
+        with patch.object(retopo_tool.bmesh, 'from_edit_mesh', return_value=self.bm):
+            retopo_tool.RP_OT_hover.invoke(None, context, event)
+        polygons, border, error = retopo_tool.grid_hover_preview(context, self.bm, Vector((0, 0)))
+        self.assertEqual(polygons, [])
+        self.assertEqual(len(border), 7)
+        self.assertIn('even number', error)
+        self.assertIn('Quads Only', context.area.headers[-1])
+
+    def test_fill_hole_mixed_projection_failure_does_not_fall_back_to_flat_faces(self):
+        rim = self.hole_ring()
+        t.select(self.bm, rim[0])
+        counts = len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)
+        with self.assertRaises(ValueError):
+            t.fill_hole(self.bm, rim, lambda co: Vector((10, 10, 0)))
+        self.assertEqual(counts, (len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)))
+        self.assertEqual(t.active(self.bm), rim[0])
+
+    def test_grid_hover_finds_hole_without_selection_or_mesh_changes(self):
+        self.front_view()
+        rim = self.hole_ring()
+        context = self.grid_context()
+        originals = [v.co.copy() for v in self.bm.verts]
+        counts = (len(self.bm.verts), len(self.bm.edges), len(self.bm.faces))
+        found = retopo_tool.hole_at_mouse(context, self.bm, Vector((0, 0)))
+        self.assertEqual(set(found), set(rim))
+        polygons, border, error = retopo_tool.grid_hover_preview(context, self.bm, Vector((0, 0)))
+        self.assertEqual(len(polygons), 4)
+        self.assertEqual(len(border), 8)
+        self.assertIsNone(error)
+        self.assertEqual(counts, (len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)))
+        self.assertEqual(originals, [v.co for v in self.bm.verts])
+        self.assertFalse(any(f.select for f in self.bm.faces))
+
+    def test_grid_hover_rejects_existing_surface_outer_border_and_backfaces(self):
+        self.front_view()
+        self.hole_ring()
+        context = self.grid_context()
+        self.assertIsNone(retopo_tool.hole_at_mouse(context, self.bm, Vector((1.5, 0))))
+        self.assertIsNone(retopo_tool.hole_at_mouse(context, self.bm, Vector((3, 0))))
+        self.bm.clear()
+        self.hole_ring(reverse=True)
+        retopo_tool.invalidate_visibility()
+        self.assertIsNone(retopo_tool.hole_at_mouse(context, self.bm, Vector((0, 0))))
+
+    def test_grid_hover_rejects_occluded_and_hidden_holes(self):
+        self.front_view()
+        rim = self.hole_ring()
+        context = self.grid_context()
+        cover = [self.bm.verts.new((x, y, 1)) for x, y in ((-2, -2), (2, -2), (2, 2), (-2, 2))]
+        face = self.bm.faces.new(cover)
+        self.assertIsNone(retopo_tool.hole_at_mouse(context, self.bm, Vector((0, 0))))
+        self.bm.faces.remove(face)
+        self.bm.edges.get((rim[0], rim[1])).hide_set(True)
+        retopo_tool.invalidate_visibility()
+        self.assertIsNone(retopo_tool.hole_at_mouse(context, self.bm, Vector((0, 0))))
+
+    def test_grid_hover_selects_the_hole_under_cursor_among_multiple_holes(self):
+        self.front_view()
+        left = self.hole_ring(center=(-3, 0))
+        right = self.hole_ring(center=(3, 0))
+        context = self.grid_context()
+        self.assertEqual(set(retopo_tool.hole_at_mouse(context, self.bm, Vector((-3, 0)))), set(left))
+        self.assertEqual(set(retopo_tool.hole_at_mouse(context, self.bm, Vector((3, 0)))), set(right))
+
+    def test_grid_fill_preview_commit_project_only_new_vertices(self):
+        rim = self.hole_ring()
+        original = set(self.bm.verts)
+        positions = {v: v.co.copy() for v in original}
+        snap = lambda co: Vector((co.x, co.y, 0.25))
+        predicted = retopo_tool.grid_preview(self.bm, rim, snap)
+        faces = t.grid_fill(self.bm, rim, snap)
+        self.assertEqual(predicted, [[v.co for v in f.verts] for f in faces])
+        self.assertEqual(len(faces), 4)
+        self.assertEqual(len(self.bm.verts), 17)
+        self.assertTrue(all(len(f.verts) == 4 and f.material_index == 2 and f.select for f in faces))
+        self.assertEqual(positions, {v: v.co for v in original})
+        self.assertTrue(all(v.co.z == 0.25 for v in self.bm.verts if v not in original))
+        self.assertTrue(all(len(self.bm.edges.get((a, b)).link_faces) == 2 for a, b in zip(rim, rim[1:] + rim[:1])))
+        self.bm.normal_update()
+        self.assertTrue(all(f.normal.z > 0 for f in faces))
+
+    def test_grid_fill_handles_four_and_six_sided_holes(self):
+        for count in (4, 6):
+            with self.subTest(count=count):
+                self.bm.clear()
+                rim = self.hole_ring(count=count)
+                faces = t.grid_fill(self.bm, rim)
+                self.assertEqual(len(faces), count // 2 - 1)
+                self.assertTrue(all(len(f.verts) == 4 for f in faces))
+
+    def test_grid_fill_odd_rim_is_highlighted_without_edits(self):
+        self.front_view()
+        rim = self.hole_ring(count=7)
+        context = self.grid_context()
+        context.scene.retopo_tool.quad_only = True
+        polygons, border, error = retopo_tool.grid_hover_preview(context, self.bm, Vector((0, 0)))
+        self.assertEqual(polygons, [])
+        self.assertEqual(len(border), 7)
+        self.assertIn('even number', error)
+        self.assertEqual(len(self.bm.faces), 7)
+        self.assertEqual(len(self.bm.verts), 14)
+
+    def test_grid_fill_projection_failure_rolls_back_everything(self):
+        rim = self.hole_ring()
+        t.select(self.bm, rim[0])
+        counts = (len(self.bm.verts), len(self.bm.edges), len(self.bm.faces))
+        self.bm.normal_update()
+        normals = [f.normal.copy() for f in self.bm.faces]
+        with self.assertRaises(ValueError):
+            t.grid_fill(self.bm, rim, lambda co: Vector((10, 10, 0)))
+        self.assertEqual(counts, (len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)))
+        self.assertEqual(normals, [f.normal for f in self.bm.faces])
+        self.assertEqual(t.active(self.bm), rim[0])
+
+    def test_grid_click_applies_preview_and_stays_in_grid_mode(self):
+        self.front_view()
+        rim = self.hole_ring()
+        context = self.grid_context()
+        stroke = SimpleNamespace(report=lambda *args: None)
+        event = self.strip_event('LEFTMOUSE', (0, 0), 'PRESS', ctrl=False)
+        with patch.object(retopo_tool.bmesh, 'from_edit_mesh', return_value=self.bm), \
+             patch.object(retopo_tool, 'sync') as sync:
+            self.assertTrue(retopo_tool.RP_OT_grid_fill.poll(context))
+            self.assertFalse(retopo_tool.RP_OT_click.poll(context))
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.invoke(stroke, context, event), {'FINISHED'})
+            sync.assert_called_once_with(context.edit_object)
+        self.assertEqual(len(self.bm.faces), 12)
+        self.assertEqual(context.scene.retopo_tool.mode, 'GRID')
+        self.assertIsNone(retopo_tool.hole_at_mouse(context, self.bm, Vector((0, 0))))
+
+    def test_grid_hover_notifies_quad_count_and_cached_preview_invalidates(self):
+        self.front_view()
+        self.hole_ring()
+        context = self.grid_context()
+        event = self.strip_event('MOUSEMOVE', (0, 0), ctrl=False)
+        with patch.object(retopo_tool.bmesh, 'from_edit_mesh', return_value=self.bm):
+            self.assertEqual(retopo_tool.RP_OT_hover.invoke(None, context, event), {'PASS_THROUGH'})
+        self.assertIn('4 quads', context.area.headers[-1])
+        with patch.object(retopo_tool, 'grid_preview', side_effect=AssertionError('preview rebuilt')):
+            self.assertEqual(len(retopo_tool.grid_hover_preview(context, self.bm, Vector((0, 0)))[0]), 4)
+            self.assertEqual(len(retopo_tool.grid_hover_preview(context, self.bm, Vector((0.1, 0.1)))[0]), 4)
+        retopo_tool.invalidate_visibility()
+        self.assertIsNone(retopo_tool._grid_preview_cache)
+
+    def test_grid_mode_toggles_off_and_can_exit_without_editing(self):
+        context = self.grid_context()
+        op = SimpleNamespace(mode='GRID')
+        self.assertEqual(retopo_tool.RP_OT_mode.execute(op, context), {'FINISHED'})
+        self.assertEqual(context.scene.retopo_tool.mode, 'RETOPO')
+        retopo_tool.RP_OT_mode.execute(op, context)
+        self.assertEqual(context.scene.retopo_tool.mode, 'GRID')
+        self.assertEqual(retopo_tool.RP_OT_grid_stop.execute(None, context), {'FINISHED'})
+        self.assertEqual(context.scene.retopo_tool.mode, 'RETOPO')
+
+    def test_grid_pie_replaces_preserve_borders_with_fourth_tool(self):
+        entries = []
+        def operator(identifier, **kwargs):
+            item = SimpleNamespace(identifier=identifier, **kwargs)
+            entries.append(item)
+            return item
+        pie = SimpleNamespace(operator=operator)
+        menu = SimpleNamespace(layout=SimpleNamespace(menu_pie=lambda: pie))
+        retopo_tool.RP_MT_modes.draw(menu, self.grid_context())
+        self.assertEqual([entry.mode for entry in entries], ['RETOPO', 'BRUSH', 'BOX', 'GRID'])
+        self.assertEqual(entries[3].text, 'Fill Hole')
+        self.assertTrue(entries[3].depress)
+
+    def test_grid_fill_rectangular_hole_uses_corner_aligned_grid(self):
+        coords = [(x, 0) for x in range(3)] + [(2, y) for y in range(1, 5)]
+        coords += [(x, 4) for x in (1, 0)] + [(0, y) for y in (3, 2, 1)]
+        rim = [self.v(x, y) for x, y in coords]
+        for a, b in zip(rim, rim[1:] + rim[:1]):
+            self.bm.edges.new((a, b))
+        faces = t.grid_fill(self.bm, rim)
+        self.assertEqual(len(faces), 8)
+        self.assertTrue(all(abs(f.calc_area() - 1) < 1e-5 for f in faces))
+
+    def test_grid_side_counts_detect_actual_unequal_sides_including_corners(self):
+        coords = [(x, 0) for x in range(3)] + [(2, y) for y in range(1, 5)]
+        coords += [(x, 4) for x in (1.5, 1, 0)] + [(0, y) for y in (3, 2, 1)]
+        rim = [Vector((x, y, 0)) for x, y in coords]
+        for border in (rim, rim[3:] + rim[:3], list(reversed(rim))):
+            sides = t.rim_sides(border)
+            self.assertEqual(sorted(map(len, sides)), [3, 4, 5, 5])
+            self.assertEqual(sum(len(side) - 1 for side in sides), len(rim))
+            self.assertEqual({tuple(side[0]) for side in sides},
+                             {(0, 0, 0), (2, 0, 0), (2, 4, 0), (0, 4, 0)})
+        # Dissolving the extra top-side vertex makes the opposite counts match.
+        rim.remove(Vector((1.5, 4, 0)))
+        self.assertEqual(sorted(map(len, t.rim_sides(rim))), [3, 3, 5, 5])
+        vertices = [self.bm.verts.new(co) for co in rim]
+        for a, b in zip(vertices, vertices[1:] + vertices[:1]):
+            self.bm.edges.new((a, b))
+        faces = t.grid_fill(self.bm, vertices)
+        self.assertEqual(len(faces), 8)
+        self.assertTrue(all(len(face.verts) == 4 for face in faces))
+
+    def test_grid_side_labels_show_numbers_on_invalid_quad_fill_and_hide_with_ctrl(self):
+        self.front_view()
+        self.hole_ring(count=7)
+        context = self.grid_context()
+        context.preferences = SimpleNamespace(system=SimpleNamespace(ui_scale=1.0))
+        polygons, border, error = retopo_tool.grid_hover_preview(context, self.bm, Vector((0, 0)))
+        self.assertFalse(polygons)
+        self.assertIsNotNone(error)
+        matrix = Matrix.Translation((10, 20, 0))
+        with ExitStack() as stack:
+            calls = {name: stack.enter_context(patch.object(retopo_tool.blf, name))
+                     for name in ('size', 'color', 'enable', 'shadow', 'dimensions', 'position', 'draw', 'disable')}
+            calls['dimensions'].return_value = (8, 14)
+            stack.enter_context(patch.object(retopo_tool.view3d_utils, 'location_3d_to_region_2d',
+                                             side_effect=lambda region, view, co: co.xy))
+            retopo_tool.draw_grid_side_counts(context, border, matrix, retopo_tool.GRID_ERROR_COLOR)
+            self.assertEqual(len(calls['draw'].call_args_list), 4)
+            self.assertTrue(all(call.args[1].isdigit() for call in calls['draw'].call_args_list))
+            self.assertEqual(sorted(int(call.args[1]) for call in calls['draw'].call_args_list),
+                             sorted(map(len, t.rim_sides(border))))
+            self.assertTrue(all(Vector((call.args[1] + 4 - 10, call.args[2] + 7 - 20)).length > 10
+                                for call in calls['position'].call_args_list))
+            calls['disable'].assert_called_once_with(0, retopo_tool.blf.SHADOW)
+            context.window_manager.retopo_tool_ctrl = True
+            calls['draw'].reset_mock()
+            retopo_tool.draw_grid_side_counts(context, border, matrix, retopo_tool.GRID_COLOR)
+            calls['draw'].assert_not_called()
+
+    def test_grid_side_counts_spread_corners_around_smooth_rim(self):
+        rim = [v.co.copy() for v in self.hole_ring(count=12)]
+        self.assertEqual([len(side) for side in t.rim_sides(rim)], [4, 4, 4, 4])
+
+    def test_grid_fill_with_actual_reference_collection_and_object_transform(self):
+        self.front_view()
+        rim = self.hole_ring()
+        mesh = bpy.data.meshes.new('GridReference')
+        mesh.from_pydata([(-5, -5, 2), (5, -5, 2), (5, 5, 2), (-5, 5, 2)], [], [(0, 1, 2, 3)])
+        reference = bpy.data.objects.new('GridReference', mesh)
+        collection = bpy.data.collections.new('GridReferences')
+        collection.objects.link(reference)
+        bpy.context.scene.collection.children.link(collection)
+        context = self.grid_context()
+        context.scene.retopo_tool.target = collection
+        context.scene.retopo_tool.offset = 0.1
+        context.edit_object.matrix_world = Matrix.Translation((0, 0, 0.5))
+        context.evaluated_depsgraph_get = bpy.context.evaluated_depsgraph_get
+        original = set(self.bm.verts)
+        positions = {v: v.co.copy() for v in original}
+        try:
+            bpy.context.view_layer.update()
+            snap = retopo_tool.reference_projector(context)
+            polygons = retopo_tool.grid_preview(self.bm, rim, snap)
+            faces = t.grid_fill(self.bm, rim, snap)
+            self.assertEqual(polygons, [[v.co for v in f.verts] for f in faces])
+            self.assertEqual(positions, {v: v.co for v in original})
+            self.assertTrue(all(abs(v.co.z - 1.6) < 1e-5 for v in self.bm.verts if v not in original))
+        finally:
+            bpy.data.objects.remove(reference, do_unlink=True)
+            bpy.data.collections.remove(collection)
+            bpy.data.meshes.remove(mesh)
+
+    def test_grid_click_updates_real_edit_mesh(self):
+        self.front_view()
+        self.hole_ring()
+        mesh = bpy.data.meshes.new('GridEdit')
+        self.bm.to_mesh(mesh)
+        obj = bpy.data.objects.new('GridEdit', mesh)
+        bpy.context.collection.objects.link(obj)
+        original = bpy.context.view_layer.objects.active
+        selected = list(bpy.context.selected_objects)
+        retopo_tool.register()
+        try:
+            for item in selected:
+                item.select_set(False)
+            obj.select_set(True)
+            bpy.context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='EDIT')
+            area = next(a for a in bpy.context.screen.areas if a.type == 'VIEW_3D')
+            region = next(r for r in area.regions if r.type == 'WINDOW')
+            with bpy.context.temp_override(area=area, region=region):
+                self.assertEqual(bpy.ops.mesh.retopo_tool_mode(mode='GRID'), {'FINISHED'})
+                self.assertTrue(retopo_tool.RP_OT_grid_fill.poll(bpy.context))
+                stroke = SimpleNamespace(report=lambda *args: None)
+                event = self.strip_event('LEFTMOUSE', (0, 0), 'PRESS', ctrl=False)
+                self.assertEqual(retopo_tool.RP_OT_grid_fill.invoke(stroke, bpy.context, event), {'FINISHED'})
+                self.assertEqual(len(bmesh.from_edit_mesh(mesh).faces), 12)
+                self.assertEqual(bpy.ops.mesh.retopo_tool_grid_stop(), {'FINISHED'})
+                self.assertEqual(bpy.context.scene.retopo_tool.mode, 'RETOPO')
+            bpy.ops.object.mode_set(mode='OBJECT')
+            self.assertEqual(len(mesh.polygons), 12)
+        finally:
+            if bpy.context.mode == 'EDIT_MESH':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            retopo_tool.unregister()
+            bpy.data.objects.remove(obj, do_unlink=True)
+            bpy.data.meshes.remove(mesh)
+            bpy.context.view_layer.objects.active = original
+            for item in selected:
+                item.select_set(True)
+
+    def strip_setup(self, start=(0, 0), on_edge=True, snap=None, target_y=None):
         self.front_view()
         edge = self.bm.edges.new((self.v(-10, 0), self.v(10, 0)))
+        if target_y is not None:
+            self.bm.edges.new((self.v(-10, target_y), self.v(10, target_y)))
         t.select(self.bm, edge)
         obj = SimpleNamespace(data=None, matrix_world=Matrix.Identity(4))
-        area = SimpleNamespace(tag_redraw=lambda: None)
+        headers = []
+        area = SimpleNamespace(tag_redraw=lambda: None, header_text_set=headers.append, headers=headers)
         region = SimpleNamespace(x=0, y=0, as_pointer=lambda: 123)
         settings = SimpleNamespace(mode='RETOPO', target=None, snapping=True, quad_only=False,
                                    radius=14, merge_radius=10, offset=0.001)
@@ -93,9 +569,152 @@ class TopologyTests(unittest.TestCase):
 
     def test_ctrl_drag_from_empty_space_includes_press_position(self):
         context, stroke, edge = self.strip_setup(start=(0, 25), on_edge=False)
+        self.assertEqual(self.strip_modal(context, stroke, 'MOUSEMOVE', (0, 65)), {'RUNNING_MODAL'})
         self.assertEqual(self.strip_modal(context, stroke, 'LEFTMOUSE', (0, 65), 'RELEASE'), {'FINISHED'})
         self.assertEqual(len(self.bm.faces), 4)
         self.assertAlmostEqual(max(v.co.y for v in self.bm.verts), 65)
+
+    def test_strip_click_jitter_does_not_start_drawing(self):
+        context, stroke, edge = self.strip_setup(start=(0, 25), on_edge=False)
+        self.strip_modal(context, stroke, 'MOUSEMOVE', (8, 30))
+        self.assertFalse(stroke.dragging)
+        self.assertIsNone(retopo_tool._strip_preview)
+        self.assertEqual(context.area.headers, [])
+        self.assertEqual(self.strip_modal(context, stroke, 'LEFTMOUSE', (8, 30), 'RELEASE'), {'FINISHED'})
+        self.assertEqual(len(self.bm.faces), 1)
+        self.assertEqual(len(next(iter(self.bm.faces)).verts), 3)
+        self.assertTrue(any(v.co == Vector((0, 25, 0)) for v in self.bm.verts))
+
+    def test_strip_cannot_start_on_button_release_alone(self):
+        context, stroke, edge = self.strip_setup(start=(0, 25), on_edge=False)
+        self.assertEqual(self.strip_modal(context, stroke, 'LEFTMOUSE', (0, 80), 'RELEASE'), {'FINISHED'})
+        self.assertFalse(stroke.dragging)
+        self.assertEqual(len(self.bm.faces), 1)
+        self.assertEqual(len(next(iter(self.bm.faces)).verts), 3)
+
+    def test_releasing_ctrl_before_threshold_keeps_click_action(self):
+        context, stroke, edge = self.strip_setup(start=(0, 25), on_edge=False)
+        event = self.strip_event('LEFT_CTRL', (0, 25), 'RELEASE', ctrl=False)
+        self.assertEqual(retopo_tool.RP_OT_click.modal(stroke, context, event), {'RUNNING_MODAL'})
+        self.strip_modal(context, stroke, 'MOUSEMOVE', (0, 60))
+        self.assertFalse(stroke.dragging)
+        self.assertEqual(self.strip_modal(context, stroke, 'LEFTMOUSE', (0, 60), 'RELEASE'), {'FINISHED'})
+        self.assertEqual(len(self.bm.faces), 1)
+        self.assertEqual(len(next(iter(self.bm.faces)).verts), 3)
+
+    def test_strip_status_appears_at_start_and_clears_on_cancel(self):
+        context, stroke, edge = self.strip_setup()
+        self.strip_modal(context, stroke, 'MOUSEMOVE', (0, 30))
+        self.assertIn('Drawing strip', context.area.headers[-1])
+        self.assertIsNotNone(retopo_tool._strip_preview)
+        self.strip_modal(context, stroke, 'ESC', (0, 30), 'PRESS')
+        self.assertIsNone(context.area.headers[-1])
+        self.assertIsNone(retopo_tool._strip_target)
+
+    def test_drag_strip_connects_to_existing_edge_without_duplicate_vertices(self):
+        context, stroke, edge = self.strip_setup(target_y=80)
+        target = next(e for e in self.bm.edges if e != edge)
+        originals = [v.co.copy() for v in target.verts]
+        self.strip_modal(context, stroke, 'MOUSEMOVE', (0, 30))
+        self.strip_modal(context, stroke, 'MOUSEMOVE', (0, 80))
+        expected = retopo_tool._strip_preview[1]
+        self.assertIsNotNone(retopo_tool._strip_target)
+        self.assertIn('Connect strip', context.area.headers[-1])
+        self.assertEqual(self.strip_modal(context, stroke, 'LEFTMOUSE', (0, 80), 'RELEASE'), {'FINISHED'})
+        self.assertEqual(len(self.bm.faces), 4)
+        self.assertEqual(len(self.bm.verts), 10)
+        self.assertEqual(expected, [[v.co for v in face.verts] for face in self.bm.faces])
+        self.assertEqual(originals, [v.co for v in target.verts])
+        self.assertEqual(t.active(self.bm), target)
+        self.assertEqual(len(target.link_faces), 1)
+        self.assertIsNone(retopo_tool._strip_target)
+        self.assertIsNone(context.area.headers[-1])
+
+    def test_strip_can_leave_hovered_destination_before_release(self):
+        context, stroke, edge = self.strip_setup(target_y=80)
+        target = next(e for e in self.bm.edges if e != edge)
+        self.strip_modal(context, stroke, 'MOUSEMOVE', (0, 80))
+        self.assertIsNotNone(retopo_tool._strip_target)
+        self.strip_modal(context, stroke, 'MOUSEMOVE', (25, 60))
+        self.assertIsNone(retopo_tool._strip_target)
+        self.assertEqual(self.strip_modal(context, stroke, 'LEFTMOUSE', (25, 60), 'RELEASE'), {'FINISHED'})
+        self.assertFalse(target.link_faces)
+        self.assertNotEqual(t.active(self.bm), target)
+
+    def test_strip_connects_near_destination_endpoint(self):
+        context, stroke, edge = self.strip_setup(target_y=80)
+        target = next(e for e in self.bm.edges if e != edge)
+        self.strip_modal(context, stroke, 'MOUSEMOVE', (9, 80))
+        self.assertIsNotNone(retopo_tool._strip_target)
+        self.assertEqual(self.strip_modal(context, stroke, 'LEFTMOUSE', (9, 80), 'RELEASE'), {'FINISHED'})
+        self.assertEqual(t.active(self.bm), target)
+        self.assertEqual(len(target.link_faces), 1)
+
+    def test_strip_can_connect_to_boundary_of_existing_face(self):
+        source_face, verts = self.quad()
+        source_face.material_index = 2
+        source = self.bm.edges.get((verts[2], verts[3]))
+        a, b, c, d = self.v(0, 8), self.v(2, 8), self.v(2, 10), self.v(0, 10)
+        target_face = self.bm.faces.new((a, b, c, d))
+        target = self.bm.edges.get((a, b))
+        originals = [v.co.copy() for v in target.verts]
+        predicted = retopo_tool.strip_preview(self.bm, source, [Vector((1, 4, 0)), Vector((1, 6, 0))], target=target)
+        faces = t.quad_strip(self.bm, source, [Vector((1, 4, 0)), Vector((1, 6, 0))], target=target)
+        self.assertEqual(predicted, [[v.co for v in face.verts] for face in faces])
+        self.assertEqual(len(self.bm.verts), 12)
+        self.assertEqual(len(target.link_faces), 2)
+        self.assertEqual(originals, [v.co for v in target.verts])
+        self.bm.normal_update()
+        self.assertTrue(all(f.normal.dot(target_face.normal) > 0.99 for f in faces))
+        self.assertTrue(all(f.material_index == 2 for f in faces))
+
+    def test_strip_can_bridge_adjacent_edges_with_triangle(self):
+        a, b, c = self.v(0, 0), self.v(20, 0), self.v(20, 20)
+        source, target = self.bm.edges.new((a, b)), self.bm.edges.new((b, c))
+        predicted = retopo_tool.strip_preview(self.bm, source, [], target=target)
+        faces = t.quad_strip(self.bm, source, [], target=target)
+        self.assertEqual(len(faces), 1)
+        self.assertEqual(len(faces[0].verts), 3)
+        self.assertEqual(predicted, [[v.co for v in faces[0].verts]])
+        self.assertEqual(len(self.bm.verts), 3)
+        self.assertEqual(t.active(self.bm), target)
+
+    def test_canceling_strip_connection_preserves_destination(self):
+        context, stroke, edge = self.strip_setup(target_y=80)
+        self.strip_modal(context, stroke, 'MOUSEMOVE', (0, 80))
+        self.assertEqual(self.strip_modal(context, stroke, 'RIGHTMOUSE', (0, 80), 'PRESS'), {'CANCELLED'})
+        self.assertEqual((len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)), (4, 2, 0))
+        self.assertEqual(t.active(self.bm), edge)
+        self.assertIsNone(retopo_tool._strip_target)
+
+    def test_strip_connection_rollback_preserves_existing_normals(self):
+        source_face, verts = self.quad()
+        edge = self.bm.edges.get((verts[2], verts[3]))
+        a, b, c, d = self.v(0, 8), self.v(2, 8), self.v(2, 10), self.v(0, 10)
+        target_face = self.bm.faces.new((d, c, b, a))
+        target = self.bm.edges.get((a, b))
+        t.select(self.bm, edge)
+        self.bm.normal_update()
+        normals = [f.normal.copy() for f in self.bm.faces]
+        counts = (len(self.bm.verts), len(self.bm.edges), len(self.bm.faces))
+        with self.assertRaises(ValueError):
+            t.quad_strip(self.bm, edge, [Vector((1, 4, 0)), Vector((1, 6, 0))], target=target)
+        self.bm.normal_update()
+        self.assertEqual((len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)), counts)
+        self.assertEqual(normals, [f.normal for f in self.bm.faces])
+        self.assertEqual(t.active(self.bm), edge)
+
+    def test_strip_rejects_connection_to_interior_edge_without_edits(self):
+        face, verts = self.quad()
+        target = self.bm.edges.get((verts[0], verts[1]))
+        self.bm.faces.new((verts[1], verts[0], self.v(0, -2), self.v(2, -2)))
+        source = self.bm.edges.new((self.v(0, -8), self.v(2, -8)))
+        t.select(self.bm, source)
+        counts = (len(self.bm.verts), len(self.bm.edges), len(self.bm.faces))
+        with self.assertRaises(ValueError):
+            t.quad_strip(self.bm, source, [Vector((1, -6, 0))], target=target)
+        self.assertEqual((len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)), counts)
+        self.assertEqual(t.active(self.bm), source)
 
     def test_ctrl_drag_cancel_preserves_mesh_and_selection(self):
         for cancel in ('ESC', 'RIGHTMOUSE'):

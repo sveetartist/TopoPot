@@ -1,5 +1,6 @@
 import bpy
 import bmesh
+import blf
 import gpu
 import importlib
 from math import cos, sin, tau
@@ -33,6 +34,12 @@ COLOR_PRESET_ITEMS = (
 )
 DEFAULT_OVERLAY_COLOR = COLOR_PRESETS['BLUE'][:3]
 DEFAULT_OVERLAY_OPACITY = 0.25
+STRIP_START_DISTANCE = 16
+STRIP_COLOR = (1.0, 0.55, 0.1, 1.0)
+STRIP_CONNECT_COLOR = (0.2, 1.0, 0.45, 1.0)
+GRID_COLOR = (0.1, 0.9, 1.0, 1.0)
+GRID_ERROR_COLOR = (1.0, 0.25, 0.15, 1.0)
+GRID_HINT = "Fill Hole | Quads Only | Hold Ctrl: Quad/Tri | Left-click to fill | Esc / right-click returns to Retopo"
 
 
 def mesh_filter(self, obj):
@@ -86,15 +93,18 @@ def retopo_color(context):
 
 
 def update_mode(self, context):
+    global _grid_preview_cache
+    _grid_preview_cache = None
     if context.mode == 'EDIT_MESH' and context.area and context.area.type == 'VIEW_3D':
         topology.clear_pending(bmesh.from_edit_mesh(context.edit_object.data), discard=self.quad_only)
         bpy.ops.wm.tool_set_by_id(name='builtin.select_box' if self.mode == 'BOX' else RP_Tool.bl_idname)
+        context.area.header_text_set(GRID_HINT if self.mode == 'GRID' else None)
         context.area.tag_redraw()
 
 
 class RP_Settings(bpy.types.PropertyGroup):
     preserve_borders: bpy.props.BoolProperty(name="Preserve Borders", description="Relax only interior surface vertices, keeping open borders and loose geometry fixed", default=False)
-    mode: EnumProperty(name="Mode", items=(('RETOPO', "Retopo", "Create and move topology"), ('BRUSH', "Brush", "Move vertices; Shift relaxes"), ('BOX', "Box Select", "Blender's native box selection")), default='RETOPO', update=update_mode)
+    mode: EnumProperty(name="Mode", items=(('RETOPO', "Retopo", "Create and move topology"), ('BRUSH', "Brush", "Move vertices; Shift relaxes"), ('BOX', "Box Select", "Blender's native box selection"), ('GRID', "Fill Hole", "Hover a hole to preview quads; hold Ctrl to allow triangles; left-click to fill")), default='RETOPO', update=update_mode)
     quad_only: BoolProperty(name="Quad Mode", description="Extrude quads with the new edge centered at the cursor; allow triangles when connecting neighboring edges", default=False)
     snapping: BoolProperty(name="Snapping", description="Snap to the reference surface and automatically merge nearby vertices", default=True)
     brush_radius: IntProperty(name="Brush Radius", default=75, min=5, max=500, subtype='PIXEL')
@@ -141,6 +151,8 @@ def cached_tree(kind, obj, build, counts=()):
 
 @bpy.app.handlers.persistent
 def invalidate_visibility(scene=None, depsgraph=None):
+    global _grid_preview_cache
+    _grid_preview_cache = None
     if depsgraph is None:
         _visibility_cache.clear()
         return
@@ -213,7 +225,7 @@ def reference_pick_tolerance(context, co):
     return tolerance
 
 
-def pick(context, bm, mouse, exclude=None, vertices_only=False, radius=None):
+def pick(context, bm, mouse, exclude=None, vertices_only=False, radius=None, edges_only=False):
     matrix = context.edit_object.matrix_world
     def build_edit_tree():
         verts = list(bm.verts)
@@ -242,7 +254,7 @@ def pick(context, bm, mouse, exclude=None, vertices_only=False, radius=None):
         if point is not None:
             coords[vert] = point
             distance = (point - mouse).length
-            if distance < vr and visible(matrix @ vert.co):
+            if not edges_only and distance < vr and visible(matrix @ vert.co):
                 best_v, vr = vert, distance
     if vertices_only:
         return best_v
@@ -255,7 +267,7 @@ def pick(context, bm, mouse, exclude=None, vertices_only=False, radius=None):
         distance = (mouse - (a + t * delta)).length
         if distance < er and visible(matrix @ edge.verts[0].co.lerp(edge.verts[1].co, t)):
             best_e, er = edge, distance
-    return best_v if best_v is not None else best_e
+    return best_e if edges_only else (best_v if best_v is not None else best_e)
 
 
 def placement(context, mouse, anchor):
@@ -369,21 +381,187 @@ def preview(bm, anchor, hit, point, edge_factor=0.5, bridge_mode=False, with_kin
 
 
 def sync(obj, destructive=True):
+    global _grid_preview_cache
+    _grid_preview_cache = None
     _visibility_cache.pop(('edit', object_key(obj)), None)
     bm = bmesh.from_edit_mesh(obj.data)
     bm.normal_update()
     bmesh.update_edit_mesh(obj.data, loop_triangles=True, destructive=destructive)
 
 
-def strip_preview(bm, edge, points, snap=None):
+def strip_preview(bm, edge, points, snap=None, target=None):
     copy = bm.copy()
     try:
         copy.edges.ensure_lookup_table()
         source = copy.edges[list(bm.edges).index(edge)]
-        faces = topology.quad_strip(copy, source, points, snap)
+        destination = copy.edges[list(bm.edges).index(target)] if target is not None else None
+        faces = topology.quad_strip(copy, source, points, snap, destination)
         return [[v.co.copy() for v in face.verts] for face in faces]
     finally:
         copy.free()
+
+
+def point_in_polygon(point, polygon):
+    inside = False
+    for a, b in zip(polygon, polygon[1:] + polygon[:1]):
+        if (a.y > point.y) != (b.y > point.y):
+            crossing = a.x + (point.y - a.y) * (b.x - a.x) / (b.y - a.y)
+            if point.x < crossing:
+                inside = not inside
+    return inside
+
+
+def polygon_normal(coords):
+    normal = sum((a.cross(b) for a, b in zip(coords, coords[1:] + coords[:1])), Vector())
+    return normal.normalized() if normal.length > 1e-10 else normal
+
+
+def hole_at_mouse(context, bm, mouse):
+    """Choose the nearest front-facing rim containing the cursor in screen space."""
+    matrix = context.edit_object.matrix_world
+    candidates = []
+    origin = view3d_utils.region_2d_to_origin_3d(context.region, context.region_data, mouse)
+    direction = view3d_utils.region_2d_to_vector_3d(context.region, context.region_data, mouse)
+    verts = list(bm.verts)
+    indices = {v: i for i, v in enumerate(verts)}
+    def build_edit_tree():
+        return BVHTree.FromPolygons([matrix @ v.co for v in verts],
+                                   [tuple(indices[v] for v in f.verts) for f in bm.faces if not f.hide])
+    tree = None
+    reference = None
+    for loop in topology.boundary_loops(bm):
+        world = [matrix @ v.co for v in loop]
+        screen = [view3d_utils.location_3d_to_region_2d(context.region, context.region_data, p) for p in world]
+        if any(p is None for p in screen) or not point_in_polygon(mouse, screen):
+            continue
+        normal = polygon_normal(world)
+        if normal.length < 1e-10:
+            continue
+        adjacent = {bm.edges.get((a, b)).link_faces[0] for a, b in zip(loop, loop[1:] + loop[:1])}
+        surrounding = sum((polygon_normal([matrix @ v.co for v in face.verts]) for face in adjacent), Vector())
+        if normal.dot(surrounding) < -1e-5:
+            continue
+        denominator = normal.dot(direction)
+        # Outer borders traverse the other way; they must not cover existing faces.
+        if denominator >= -1e-6:
+            continue
+        center = sum(world, Vector()) / len(world)
+        distance = (center - origin).dot(normal) / denominator
+        if distance <= 0:
+            continue
+        if tree is None:
+            tree = cached_tree('edit', context.edit_object, build_edit_tree,
+                               (len(bm.verts), len(bm.edges), len(bm.faces)))
+            reference = reference_tree(context)
+        location, _, _, hit_distance = tree.ray_cast(origin, direction)
+        if location is not None and hit_distance <= distance + 1e-5:
+            continue
+        if any(not visible_from_view(context, co, tree) or
+               (reference is not None and not visible_from_view(context, co, reference,
+                reference_pick_tolerance(context, co))) for co in world):
+            continue
+        area = abs(sum(a.x * b.y - b.x * a.y for a, b in zip(screen, screen[1:] + screen[:1])))
+        candidates.append((distance, area, loop))
+    return min(candidates, key=lambda item: item[:2])[2] if candidates else None
+
+
+def grid_preview(bm, vertices, snap=None, quad_only=False):
+    copy = bm.copy()
+    try:
+        copy.verts.ensure_lookup_table()
+        indices = {v: i for i, v in enumerate(bm.verts)}
+        rim = [copy.verts[indices[v]] for v in vertices]
+        faces = topology.fill_hole(copy, rim, snap, quad_only)
+        return [[v.co.copy() for v in face.verts] for face in faces]
+    finally:
+        copy.free()
+
+
+_grid_preview_cache = None
+
+
+def fill_quads_only(context):
+    return not getattr(context.window_manager, 'retopo_tool_ctrl', False)
+
+
+def grid_hover_preview(context, bm, mouse):
+    global _grid_preview_cache
+    settings = context.scene.retopo_tool
+    quad_only = fill_quads_only(context)
+    matrix = context.edit_object.matrix_world
+    view = context.region_data.perspective_matrix
+    signature = (object_key(context.edit_object), context.region.as_pointer(),
+                 tuple(value for row in matrix for value in row),
+                 tuple(value for row in view for value in row), context.region.width, context.region.height,
+                 len(bm.verts), len(bm.edges), len(bm.faces), settings.snapping,
+                 object_key(settings.target) if settings.target else None, settings.offset,
+                 settings.reference_tolerance, quad_only)
+    if (_grid_preview_cache is not None and _grid_preview_cache[0] == signature
+            and _grid_preview_cache[1] == tuple(mouse)):
+        return _grid_preview_cache[3]
+    vertices = hole_at_mouse(context, bm, mouse)
+    rim_key = tuple(hash(v) for v in vertices) if vertices is not None else None
+    polygons, border, error = [], [], None
+    if vertices is not None:
+        border = [v.co.copy() for v in vertices]
+        if (_grid_preview_cache is not None and _grid_preview_cache[0] == signature
+                and _grid_preview_cache[2] == rim_key):
+            polygons, _, error = _grid_preview_cache[3]
+        else:
+            try:
+                polygons = grid_preview(bm, vertices, reference_projector(context), quad_only)
+            except (ValueError, RuntimeError) as exception:
+                error = str(exception)
+    result = polygons, border, error
+    _grid_preview_cache = signature, tuple(mouse), rim_key, result
+    return result
+
+
+class RP_OT_grid_fill(bpy.types.Operator):
+    bl_idname = "mesh.retopo_tool_grid_fill"
+    bl_label = "Fill Hole"
+    bl_description = "Fill the hole with quads snapped to Reference; hold Ctrl to allow triangles where needed"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return (context.mode == 'EDIT_MESH' and context.area and context.area.type == 'VIEW_3D'
+                and context.region and context.region.type == 'WINDOW' and context.scene.retopo_tool.mode == 'GRID')
+
+    def invoke(self, context, event):
+        track_mouse(context, event)
+        bm = bmesh.from_edit_mesh(context.edit_object.data)
+        mouse = Vector((event.mouse_region_x, event.mouse_region_y))
+        vertices = hole_at_mouse(context, bm, mouse)
+        if vertices is None:
+            self.report({'WARNING'}, "Point inside a visible closed hole")
+            return {'CANCELLED'}
+        try:
+            snap = reference_projector(context)
+            quad_only = fill_quads_only(context)
+            grid_preview(bm, vertices, snap, quad_only)
+            topology.fill_hole(bm, vertices, snap, quad_only)
+            sync(context.edit_object)
+        except (ValueError, RuntimeError) as error:
+            self.report({'WARNING'}, str(error))
+            return {'CANCELLED'}
+        context.area.header_text_set(GRID_HINT)
+        context.area.tag_redraw()
+        return {'FINISHED'}
+
+
+class RP_OT_grid_stop(bpy.types.Operator):
+    bl_idname = "mesh.retopo_tool_grid_stop"
+    bl_label = "Leave Fill Hole"
+    bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return RP_OT_grid_fill.poll(context)
+
+    def execute(self, context):
+        context.scene.retopo_tool.mode = 'RETOPO'
+        return {'FINISHED'}
 
 
 class RP_OT_click(bpy.types.Operator):
@@ -411,6 +589,7 @@ class RP_OT_click(bpy.types.Operator):
             self.obj, self.area, self.region = obj, context.area, context.region
             self.start = mouse
             self.dragging = False
+            self.strip_click_only = False
             self.strip_gesture = True
             self.strip_on_edge = hit == anchor
             try:
@@ -543,45 +722,64 @@ class RP_OT_click(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def modal_strip(self, context, event):
-        global _strip_preview
+        global _strip_preview, _strip_target
         if (context.mode != 'EDIT_MESH' or context.edit_object != self.obj
                 or context.scene.retopo_tool.mode != 'RETOPO'
                 or event.type in {'ESC', 'RIGHTMOUSE'}):
-            _strip_preview = None
-            self.area.tag_redraw()
+            RP_OT_click.end_strip(self)
             return {'CANCELLED'}
         release = event.type == 'LEFTMOUSE' and event.value == 'RELEASE'
+        if not self.dragging and not event.ctrl:
+            self.strip_click_only = True
         if event.type not in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'} and not release:
             return {'RUNNING_MODAL'}
         bm = bmesh.from_edit_mesh(self.obj.data)
         bm.edges.ensure_lookup_table()
         if ((len(bm.verts), len(bm.edges), len(bm.faces)) != self.strip_counts
                 or self.edge_index >= len(bm.edges)):
-            _strip_preview = None
-            self.area.tag_redraw()
+            RP_OT_click.end_strip(self)
             return {'CANCELLED'}
         edge = bm.edges[self.edge_index]
         mouse = Vector((event.mouse_x - self.region.x, event.mouse_y - self.region.y))
         was_dragging = self.dragging
-        self.dragging |= (mouse - self.start).length > 4
+        self.dragging |= (not release and event.ctrl and not self.strip_click_only
+                          and (mouse - self.start).length >= STRIP_START_DISTANCE)
         try:
             with context.temp_override(area=self.area, region=self.region):
                 track_mouse(context, event)
                 if self.dragging:
+                    self.area.header_text_set("Drawing strip | Release to create | Hover an edge to connect | Esc / right-click cancels")
+                    _strip_target = None
+                    hit = pick(context, bm, mouse, edges_only=True)
+                    target = hit if hit is not None and hit != edge else None
+                    path = self.strip_path.copy()
                     # Empty-space presses are the first point of the drawn path.
                     samples = [self.start, mouse] if not was_dragging and not self.strip_on_edge else [mouse]
                     for sample in samples:
+                        if target is not None and sample is mouse:
+                            path.add((target.verts[0].co + target.verts[1].co) * 0.5)
+                            continue
                         point = placement(context, sample, edge)
                         if point is None:
                             raise ValueError("Cursor is outside the reference surface")
-                        self.strip_path.add(self.obj.matrix_world.inverted_safe() @ point)
-                    points = self.strip_path.positions()
-                    polygons = strip_preview(bm, edge, points, self.strip_snap)
+                        path.add(self.obj.matrix_world.inverted_safe() @ point)
+                    points = path.positions()
+                    if target is not None:
+                        center = (target.verts[0].co + target.verts[1].co) * 0.5
+                        points = [point.copy() for point in path.points]
+                        while points and (points[-1] - center).length < path.spacing * 0.6:
+                            points.pop()
+                    else:
+                        self.strip_path = path
+                    polygons = strip_preview(bm, edge, points, self.strip_snap, target)
                     _strip_preview = (self.region.as_pointer(), polygons)
+                    if target is not None:
+                        _strip_target = (self.region.as_pointer(), [v.co.copy() for v in target.verts])
+                        self.area.header_text_set("Connect strip to edge | Release to connect | Esc / right-click cancels")
                     if release:
                         if not polygons:
                             raise ValueError("Drag farther from the starting edge to draw a strip")
-                        topology.quad_strip(bm, edge, points, self.strip_snap)
+                        topology.quad_strip(bm, edge, points, self.strip_snap, target)
                         sync(self.obj)
                 elif release:
                     hit = edge if self.strip_on_edge else None
@@ -596,16 +794,25 @@ class RP_OT_click(bpy.types.Operator):
                     sync(self.obj)
         except ValueError as error:
             _strip_preview = (self.region.as_pointer(), [])
+            _strip_target = None
+            if self.dragging:
+                self.area.header_text_set(f"Drawing strip | {error} | Esc / right-click cancels")
             if release:
                 self.report({'WARNING'}, str(error))
-                _strip_preview = None
-                self.area.tag_redraw()
+                RP_OT_click.end_strip(self)
                 return {'CANCELLED'}
         self.area.tag_redraw()
         if release:
-            _strip_preview = None
+            RP_OT_click.end_strip(self)
             return {'FINISHED'}
         return {'RUNNING_MODAL'}
+
+    def end_strip(self):
+        global _strip_preview, _strip_target
+        _strip_preview = None
+        _strip_target = None
+        self.area.header_text_set(None)
+        self.area.tag_redraw()
 
     def modal_move_edge(self, context, event):
         if context.mode != 'EDIT_MESH' or context.edit_object != self.obj:
@@ -730,6 +937,7 @@ class RP_OT_click(bpy.types.Operator):
 _mouse_region = None
 _loop_preview = None
 _strip_preview = None
+_strip_target = None
 _merge_target = None
 
 
@@ -890,14 +1098,15 @@ class RP_OT_brush_size(bpy.types.Operator):
 class RP_OT_mode(bpy.types.Operator):
     bl_idname = "mesh.retopo_tool_mode"
     bl_label = "Set Retopo Mode"
-    mode: EnumProperty(items=(('RETOPO', "Retopo", ""), ('BRUSH', "Brush", ""), ('BOX', "Box Select", "")))
+    mode: EnumProperty(items=(('RETOPO', "Retopo", ""), ('BRUSH', "Brush", ""), ('BOX', "Box Select", ""), ('GRID', "Fill Hole", "")))
 
     @classmethod
     def poll(cls, context):
         return context.mode == 'EDIT_MESH' and context.area and context.area.type == 'VIEW_3D'
 
     def execute(self, context):
-        context.scene.retopo_tool.mode = self.mode
+        settings = context.scene.retopo_tool
+        settings.mode = 'RETOPO' if self.mode == 'GRID' and settings.mode == 'GRID' else self.mode
         return {'FINISHED'}
 
 
@@ -907,9 +1116,9 @@ class RP_MT_modes(bpy.types.Menu):
 
     def draw(self, context):
         pie = self.layout.menu_pie()
-        for mode, label, icon in (('RETOPO', "Retopo", 'EDITMODE_HLT'), ('BRUSH', "Brush", 'BRUSH_DATA'), ('BOX', "Box Select", 'SELECT_SET')):
-            pie.operator("mesh.retopo_tool_mode", text=label, icon=icon).mode = mode
-        pie.prop(context.scene.retopo_tool, "preserve_borders")
+        for mode, label, icon in (('RETOPO', "Retopo", 'EDITMODE_HLT'), ('BRUSH', "Brush", 'BRUSH_DATA'), ('BOX', "Box Select", 'SELECT_SET'), ('GRID', "Fill Hole", 'MESH_GRID')):
+            pie.operator("mesh.retopo_tool_mode", text=label, icon=icon,
+                         depress=context.scene.retopo_tool.mode == mode).mode = mode
 
 
 class RP_Preferences(bpy.types.AddonPreferences):
@@ -951,6 +1160,17 @@ class RP_OT_hover(bpy.types.Operator):
 
     def invoke(self, context, event):
         track_mouse(context, event)
+        if context.mode == 'EDIT_MESH' and context.scene.retopo_tool.mode == 'GRID':
+            bm = bmesh.from_edit_mesh(context.edit_object.data)
+            mouse = Vector((event.mouse_region_x, event.mouse_region_y))
+            polygons, border, error = grid_hover_preview(context, bm, mouse)
+            quads = sum(len(polygon) == 4 for polygon in polygons)
+            triangles = sum(len(polygon) == 3 for polygon in polygons)
+            counts = ', '.join(text for number, text in ((quads, f"{quads} quads"), (triangles, f"{triangles} triangles")) if number)
+            fill_mode = 'Quads Only' if fill_quads_only(context) else 'Quad/Tri (Ctrl)'
+            hint = 'Hold Ctrl: Quad/Tri' if fill_quads_only(context) else 'Release Ctrl: Quads Only'
+            message = f"Fill Hole | {fill_mode} | {error} | {hint}" if error else f"Fill Hole | {fill_mode} | {counts or 'Hover a hole'} | {hint} | Left-click to fill"
+            context.area.header_text_set(message)
         context.area.tag_redraw()
         return {'PASS_THROUGH'}
 
@@ -963,6 +1183,9 @@ class RP_Tool(bpy.types.WorkSpaceTool):
     bl_description = "Select and drag; Ctrl-click creates, cuts or bridges; Ctrl-drag from a selected boundary edge draws a quad strip"
     bl_icon = TOOL_ICON
     bl_keymap = (
+        ("mesh.retopo_tool_grid_fill", {"type": 'LEFTMOUSE', "value": 'PRESS', "any": True}, None),
+        ("mesh.retopo_tool_grid_stop", {"type": 'ESC', "value": 'PRESS'}, None),
+        ("mesh.retopo_tool_grid_stop", {"type": 'RIGHTMOUSE', "value": 'PRESS'}, None),
         ("mesh.retopo_tool_brush", {"type": 'LEFTMOUSE', "value": 'PRESS', "any": True}, None),
         ("mesh.retopo_tool_brush_size", {"type": 'F', "value": 'PRESS'}, None),
         ("mesh.retopo_tool_click", {"type": 'LEFTMOUSE', "value": 'PRESS', "any": True}, None),
@@ -981,6 +1204,8 @@ class RP_Tool(bpy.types.WorkSpaceTool):
             layout.prop(context.scene.retopo_tool, "preserve_borders")
         elif context.scene.retopo_tool.mode == 'RETOPO':
             layout.prop(context.scene.retopo_tool, "quad_only")
+        elif context.scene.retopo_tool.mode == 'GRID':
+            layout.label(text="Quads Only · Hold Ctrl: Quad/Tri")
 
 
 class RP_OT_activate(bpy.types.Operator):
@@ -1025,6 +1250,7 @@ class RP_OT_stop(bpy.types.Operator):
             topology.clear_pending(bmesh.from_edit_mesh(context.edit_object.data), discard=context.scene.retopo_tool.quad_only)
             sync(context.edit_object)
         bpy.ops.wm.tool_set_by_id(name="builtin.select_box")
+        context.area.header_text_set(None)
         return {'FINISHED'}
 
 
@@ -1050,6 +1276,8 @@ class RP_PT_panel(bpy.types.Panel):
             layout.prop(settings, "preserve_borders")
         elif settings.mode == 'RETOPO':
             layout.prop(settings, "quad_only")
+        elif settings.mode == 'GRID':
+            layout.label(text="Quads Only · Hold Ctrl: Quad/Tri")
         layout.prop(settings, "target")
         layout.prop(settings, "offset")
         layout.prop(settings, "radius")
@@ -1058,6 +1286,40 @@ class RP_PT_panel(bpy.types.Panel):
         layout.prop(context.space_data.overlay, "show_retopology", text="Retopology View")
         if context.space_data.overlay.show_retopology:
             layout.prop(context.space_data.overlay, "retopology_offset", text="View Offset")
+
+
+def draw_grid_side_counts(context, border, matrix, color):
+    if not fill_quads_only(context):
+        return
+    projected = [view3d_utils.location_3d_to_region_2d(context.region, context.region_data, matrix @ co)
+                 for co in border]
+    if not projected or any(point is None for point in projected):
+        return
+    center = sum(projected, Vector((0, 0))) / len(projected)
+    scale = context.preferences.system.ui_scale
+    blf.size(0, 14 * scale)
+    blf.color(0, *color)
+    blf.enable(0, blf.SHADOW)
+    blf.shadow(0, 3, 0.0, 0.0, 0.0, 1.0)
+    try:
+        for side in topology.rim_sides(border):
+            points = [view3d_utils.location_3d_to_region_2d(context.region, context.region_data, matrix @ co)
+                      for co in side]
+            lengths = [(b - a).length for a, b in zip(points, points[1:])]
+            remaining = sum(lengths) / 2
+            position = points[0].copy()
+            for a, b, length in zip(points, points[1:], lengths):
+                if remaining <= length:
+                    position = a.lerp(b, remaining / length) if length else a.copy()
+                    break
+                remaining -= length
+            position += (position - center).normalized() * (16 * scale)
+            label = str(len(side))
+            width, height = blf.dimensions(0, label)
+            blf.position(0, position.x - width / 2, position.y - height / 2, 0)
+            blf.draw(0, label)
+    finally:
+        blf.disable(0, blf.SHADOW)
 
 
 def draw_hover():
@@ -1088,8 +1350,14 @@ def draw_hover():
     kind = 'POINTS'
     preview_color = retopo_color(context)
     snapped_points = []
-    if _strip_preview is not None and _strip_preview[0] == context.region.as_pointer():
+    grid_border = []
+    if settings.mode == 'GRID':
+        polygons, grid_border, error = grid_hover_preview(context, bm, mouse)
+        kind = 'STRIP'
+        preview_color = GRID_ERROR_COLOR if error else GRID_COLOR
+    elif _strip_preview is not None and _strip_preview[0] == context.region.as_pointer():
         kind, polygons = 'STRIP', _strip_preview[1]
+        preview_color = STRIP_CONNECT_COLOR if _strip_target is not None else STRIP_COLOR
     elif _loop_preview is not None and _loop_preview[0] == context.region.as_pointer():
         kind, polygons = 'LINES', _loop_preview[1]
     elif context.window_manager.retopo_tool_ctrl:
@@ -1119,8 +1387,9 @@ def draw_hover():
         if kind == 'STRIP':
             for polygon in polygons:
                 outline = screen(polygon)
-                if len(outline) == 4:
-                    draw('TRIS', [outline[i] for i in (0, 1, 2, 0, 2, 3)],
+                if len(outline) in {3, 4}:
+                    indices = (0, 1, 2) if len(outline) == 3 else (0, 1, 2, 0, 2, 3)
+                    draw('TRIS', [outline[i] for i in indices],
                          (*preview_color[:3], preview_color[3] * 0.25))
                     draw('LINE_STRIP', outline + [outline[0]], preview_color)
         elif kind == 'FACE' and len(points) >= 3:
@@ -1133,9 +1402,18 @@ def draw_hover():
             gpu.state.point_size_set(15)
             draw('POINTS', screen(snapped_points), (*preview_color[:3], 1.0))
             gpu.state.point_size_set(9)
+        if grid_border:
+            border = screen(grid_border)
+            if border:
+                draw('LINE_STRIP', border + [border[0]], preview_color)
+                draw_grid_side_counts(context, grid_border, matrix, preview_color)
         if hit is not None:
             verts = [hit] if isinstance(hit, bmesh.types.BMVert) else hit.verts
             draw('POINTS' if len(verts) == 1 else 'LINES', screen([v.co for v in verts]), preview_color)
+        if _strip_target is not None and _strip_target[0] == context.region.as_pointer():
+            gpu.state.line_width_set(5)
+            draw('LINES', screen(_strip_target[1]), STRIP_CONNECT_COLOR)
+            gpu.state.line_width_set(3)
         if _merge_target is not None and _merge_target[0] == context.region.as_pointer():
             gpu.state.point_size_set(13)
             draw('POINTS', screen([_merge_target[1]]), preview_color)
@@ -1145,7 +1423,7 @@ def draw_hover():
         gpu.state.blend_set('NONE')
 
 
-classes = (RP_Settings, RP_OT_click, RP_OT_brush, RP_OT_brush_size, RP_OT_mode, RP_MT_modes, RP_Preferences, RP_OT_hover, RP_OT_activate, RP_OT_stop, RP_PT_panel)
+classes = (RP_Settings, RP_OT_grid_fill, RP_OT_grid_stop, RP_OT_click, RP_OT_brush, RP_OT_brush_size, RP_OT_mode, RP_MT_modes, RP_Preferences, RP_OT_hover, RP_OT_activate, RP_OT_stop, RP_PT_panel)
 _draw_handle = None
 _addon_keymaps = []
 

@@ -19,7 +19,7 @@ Edit `topopot_retopo_tool/blender_manifest.toml` to update the version or metada
 Validate the resulting archive using Blender's official validator:
 
 ```sh
-blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.17.0.zip
+blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.20.0.zip
 ```
 
 ## License
@@ -50,23 +50,71 @@ In Retopo mode, select a loose or boundary edge, then hold Ctrl and left-drag
 from the middle of that edge or from empty space to draw a strip of quads.
 The strip follows the dragged path, turns with the stroke, and uses the starting
 edge's width for face spacing. This works with Quad Mode enabled or disabled.
+Keep Ctrl held and move at least 16 screen pixels while holding the left mouse
+button to start drawing. Smaller movements keep the normal Ctrl-click action;
+releasing Ctrl before drawing starts keeps that stroke as a click.
 With Snapping enabled and a Reference collection set, new corners project onto
 the reference surface with Offset. The starting edge stays in place.
 
-The faces preview while dragging. Release the left mouse button to create the
+An orange face preview and a "Drawing strip" message in the viewport header
+indicate that strip drawing is active. Hover another visible loose or boundary
+edge to connect: the preview and destination edge turn green, and the header
+shows "Connect strip to edge". Release over that edge to join the strip using
+its existing vertices. Move away to continue free drawing. Connections to
+interior edges, crossed faces, and incompatible winding are rejected; existing
+vertices and face normals stay in place. Adjacent edges can connect with a triangle.
+
+Release the left mouse button to create the
 strip in one undo step; its final outer edge becomes selected for the next stroke.
 Press Esc or right-click to cancel without changing the mesh. Invalid or folded
 strips are rejected. A Ctrl-click without dragging keeps the existing click action.
 Ctrl-dragging an interior edge, or an unselected edge, still previews a loop cut.
 
+## Fill Hole
+
+Open the Shift-Alt-Q pie menu and choose Fill Hole, which replaces the old
+Preserve Borders pie entry. Point inside a visible hole to preview the filled
+area in cyan; no selection is required. The viewport header shows the fill mode
+and the quad/triangle counts. Left-click to apply the preview in one undo step.
+Fill Hole stays active for the next hole. Choose Fill Hole again in the pie, choose another
+mode, or press Esc/right-click to return to Retopo.
+
+Quads Only is the default and requires an even number of rim vertices, at least
+four. Hold Ctrl to temporarily switch to Quad/Tri; releasing Ctrl immediately
+restores Quads Only, including when the mouse is stationary. Hold Ctrl while
+clicking to apply the mixed preview. This is independent of Retopo's Quad Mode.
+In Quads Only, numbers beside the rim show each side's vertex count, including
+both corner vertices. The four corners are detected from the sharpest rim turns.
+Counts remain visible on invalid fills so you can subdivide or dissolve rim
+vertices to match opposite sides, then hover the hole again to fill it with quads.
+
+Quad/Tri favors quad grids and searches alternative diagonals on smaller irregular
+holes to minimize triangles, then chooses better-shaped quads. Odd rims retain a
+triangle for parity; dense rims can use an interior grid patch. Narrow, concave,
+or folded quad candidates remain triangles instead of forcing poor quads. On
+larger irregular holes, triangle pairs are matched together to avoid stranding
+triangles through greedy joins. The fill follows the actual hole outline,
+including notches, and keeps the existing rim vertices.
+
+The fill reuses the hole's existing rim vertices and follows the surrounding
+topology. With Snapping enabled and Reference set, new interior vertices project
+onto the reference surface with Offset. The rim and existing geometry stay in
+place. Without Reference, the fill follows the hole boundary.
+
+Supported holes have a closed, unbranched, visible boundary with at least three
+vertices in Quad/Tri mode. The preview rejects hidden or back-facing rims,
+covered surfaces, and fills that would fold or create non-manifold geometry.
+An unsupported fill shows a red boundary and an explanation in the header.
+Preserve Borders remains available in the brush sidebar and tool settings.
+
 ## Cuts and Subdivision
 
-Choose Retopo, Brush, or Box Select in the Retopo sidebar. Box Select activates
+Choose Retopo, Brush, Box Select, or Fill Hole in the Retopo sidebar. Box Select activates
 Blender's native selection tool, including its normal modifier and X-Ray behavior.
 Choose Retopo or Brush in the sidebar to return from box selection.
 Shift-Alt-Q opens the Retopo Modes pie menu in Mesh Edit Mode, including while
 Box Select is active. Change its shortcut in Preferences > Add-ons > Retopo Pool.
-Enable Preserve Borders in the pie, sidebar, or brush tool settings to relax only
+Enable Preserve Borders in the brush sidebar or tool settings to relax only
 interior surface vertices, leaving open borders and loose geometry fixed.
 Enable Prefer Quad in Retopo mode to extrude quads while allowing triangle
 connections between neighboring edges that share a vertex.
@@ -171,4 +219,11 @@ Tests cover registration, selected-mesh activation, projection, dragging,
 progressive strips, bridges, edge subdivision, cuts across faces, previews,
 crossed-quad rejection, and persistence of pending topology in mesh data.
 Ctrl-drag tests cover curved face strips, event-independent spacing, projection,
-release, cancellation, selection, rollback of invalid strokes, and click compatibility.
+release, cancellation, selection, rollback of invalid strokes, click compatibility,
+accidental-start protection, status messages, and connections to existing edges.
+Fill Hole tests cover hole detection, hover previews, reference snapping, fixed
+rim vertices, winding and material preservation, invalid-fill rollback, the pie
+menu entry, mode switching, applying the fill to a real Edit Mode mesh, Quads Only
+by default, Ctrl press/release preview switching, concave and odd-sided holes,
+quad dominance, sliver rejection, non-greedy triangle pairing, and side vertex
+counts on unequal rims and invalid fills.

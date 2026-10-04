@@ -1,9 +1,455 @@
 """BMesh operations shared by the interactive tool and regression tests."""
 import bmesh
+from mathutils import Vector
 
 PENDING = "retopo_tool_pending"
 BASE = "retopo_tool_base"
 WINDING_ERROR = "Target edge has incompatible face winding. Flip normals."
+
+
+def boundary_loops(bm):
+    """Find closed, unbranched rims on visible manifold surface geometry."""
+    edges = {e for e in bm.edges if len(e.link_faces) == 1 and not e.hide
+             and not e.link_faces[0].hide and all(not v.hide for v in e.verts)}
+    neighbors = {}
+    for edge in edges:
+        for vertex in edge.verts:
+            neighbors.setdefault(vertex, []).append(edge)
+    remaining = set(edges)
+    loops = []
+    for seed in bm.edges:
+        if seed not in remaining:
+            continue
+        component = set()
+        queue = [seed]
+        while queue:
+            edge = queue.pop()
+            if edge in component:
+                continue
+            component.add(edge)
+            queue.extend(e for v in edge.verts for e in neighbors[v] if e not in component)
+        remaining.difference_update(component)
+        verts = {v for e in component for v in e.verts}
+        if (len(verts) < 3 or any(len(neighbors[v]) != 2 for v in verts)
+                or any(len(e.link_faces) > 2 for v in verts for e in v.link_edges)):
+            continue
+        # Traverse opposite to the surrounding face so the fill shares its winding.
+        face_loop = next(loop for loop in seed.link_faces[0].loops if loop.edge == seed)
+        start, vertex = face_loop.link_loop_next.vert, face_loop.vert
+        ordered = [start]
+        previous = seed
+        while vertex != start:
+            ordered.append(vertex)
+            following = next(e for e in neighbors[vertex] if e != previous)
+            vertex, previous = following.other_vert(vertex), following
+        loops.append(ordered)
+    return loops
+
+
+def rim_sides(coords):
+    """Split a rim at its four sharpest corners, including both side endpoints."""
+    count = len(coords)
+    if count < 3:
+        return []
+    turns = []
+    for i, co in enumerate(coords):
+        incoming = (co - coords[i - 1]).normalized()
+        outgoing = (coords[(i + 1) % count] - co).normalized()
+        turns.append(round(1.0 - incoming.dot(outgoing), 4))
+    corners = []
+    # Spread equally sharp corners around smooth rims instead of bunching them.
+    for _ in range(min(4, count)):
+        def score(i):
+            separation = min((min((i - j) % count, (j - i) % count)
+                              for j in corners), default=count)
+            return turns[i], separation, -i
+        corners.append(max((i for i in range(count) if i not in corners), key=score))
+    corners.sort()
+    return [[coords[i % count] for i in range(start, start + (end - start) % count + 1)]
+            for start, end in zip(corners, corners[1:] + corners[:1])]
+
+
+def _grid_faces(bm, vertices, edges, material, smooth, balanced=False):
+    count = len(vertices)
+    # Pick four corners with opposite sides of equal length. Prefer sharp rim
+    # corners, which gives rectangular holes a regular grid instead of a fan.
+    turns = []
+    for i, vertex in enumerate(vertices):
+        incoming = (vertex.co - vertices[i - 1].co).normalized()
+        outgoing = (vertices[(i + 1) % count].co - vertex.co).normalized()
+        turns.append(1.0 - incoming.dot(outgoing))
+    half = count // 2
+    spans = (max(1, count // 4),) if balanced else range(1, half)
+    offset, span = max(((offset, span) for offset in range(count) for span in spans),
+                       key=lambda pair: (round(sum(turns[(pair[0] + step) % count]
+                                                   for step in (0, pair[1], half, half + pair[1])), 4),
+                                         -abs(pair[1] - count / 4), -pair[0]))
+    arcs = [edges[(offset + step) % count] for step in range(span)]
+    arcs += [edges[(offset + half + step) % count] for step in range(span)]
+    return bmesh.ops.grid_fill(bm, edges=arcs, mat_nr=material, use_smooth=smooth)['faces']
+
+
+def _remove_fill(bm, originals):
+    original_verts, original_edges, original_faces = originals
+    for face in list(bm.faces):
+        if face not in original_faces:
+            bm.faces.remove(face)
+    for edge in list(bm.edges):
+        if edge not in original_edges and not edge.link_faces:
+            bm.edges.remove(edge)
+    for vertex in list(bm.verts):
+        if vertex not in original_verts and not vertex.link_edges:
+            bm.verts.remove(vertex)
+
+
+def _validate_fill(bm, vertices, faces):
+    """Reject folds and grid layouts which extend beyond a concave rim."""
+    if not faces or any(len(f.verts) not in {3, 4} for f in faces):
+        raise ValueError("This hole cannot form a valid fill")
+    normal = sum((a.co.cross(b.co) for a, b in zip(vertices, vertices[1:] + vertices[:1])), Vector())
+    axis = max(range(3), key=lambda index: abs(normal[index]))
+    axes = [index for index in range(3) if index != axis]
+    def projected(vertex):
+        return Vector((vertex.co[axes[0]], vertex.co[axes[1]]))
+    def cross(a, b):
+        return a.x * b.y - a.y * b.x
+    polygon = [projected(v) for v in vertices]
+    area = abs(sum(cross(a, b) for a, b in zip(polygon, polygon[1:] + polygon[:1])))
+    if area < 1e-10:
+        raise ValueError("The hole is too narrow or degenerate")
+    filled_area = 0
+    for face in faces:
+        check_face(bm, list(face.verts), replacing=face)
+        coords = [projected(v) for v in face.verts]
+        for i in range(1, len(coords) - 1):
+            a, b, c = coords[0], coords[i], coords[i + 1]
+            filled_area += abs(cross(b - a, c - a))
+    if abs(filled_area - area) > max(1e-8, area * 1e-4):
+        raise ValueError("This grid folds or extends outside the hole")
+
+
+def _fill_coordinates(vertices):
+    normal = sum((a.co.cross(b.co) for a, b in zip(vertices, vertices[1:] + vertices[:1])), Vector())
+    axis = max(range(3), key=lambda index: abs(normal[index]))
+    axes = [index for index in range(3) if index != axis]
+    coords = [(v.co[axes[0]], v.co[axes[1]]) for v in vertices]
+    area = sum(a[0] * b[1] - a[1] * b[0] for a, b in zip(coords, coords[1:] + coords[:1]))
+    return coords, 1 if area > 0 else -1
+
+
+def _turn(a, b, c):
+    return (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+
+
+def _face_quality(vertices, coords, orientation, indices):
+    """Reject concave/sliver quads; rank the remaining shapes by corner quality."""
+    points = [coords[index] for index in indices]
+    lengths = [(b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2
+               for a, b in zip(points, points[1:] + points[:1])]
+    if min(lengths) < 1e-16:
+        return None
+    turns = [_turn(points[i - 1], point, points[(i + 1) % len(points)]) * orientation
+             for i, point in enumerate(points)]
+    if min(turns) <= max(lengths) * 1e-8:
+        return None
+    if len(indices) == 4:
+        # About seven degrees minimum corner angle and an 8:1 edge limit.
+        # A triangle is preferable to forcing a nearly flat or very thin quad.
+        sines = [turn / (lengths[i - 1] * lengths[i]) ** 0.5 for i, turn in enumerate(turns)]
+        if min(sines) < 0.12 or max(lengths) > min(lengths) * 64:
+            return None
+        a, b, c, d = (vertices[index].co for index in indices)
+        first, second = (b - a).cross(c - a), (c - a).cross(d - a)
+        if first.length < 1e-10 or second.length < 1e-10 or first.normalized().dot(second.normalized()) < 0.7:
+            return None
+        return sum(1 / sine - 1 for sine in sines) + max(lengths) / min(lengths) - 1
+    return sum(lengths) / sum(turns)
+
+
+def _quad_dominant_layout(bm, vertices):
+    """Search polygon partitions, minimizing triangles before optimizing shape.
+
+    Unlike joining a fixed triangulation, this can change diagonals to avoid
+    stranding triangles. Bound the quartic search to keep large-hole hover fast.
+    """
+    count = len(vertices)
+    if count > 48:
+        return None
+    coords, orientation = _fill_coordinates(vertices)
+    scale = max((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2
+                for a, b in zip(coords, coords[1:] + coords[:1]))
+    epsilon = max(scale * 1e-8, 1e-12)
+
+    def inside(point):
+        result = False
+        for a, b in zip(coords, coords[1:] + coords[:1]):
+            if (a[1] > point[1]) != (b[1] > point[1]):
+                x = a[0] + (point[1] - a[1]) * (b[0] - a[0]) / (b[1] - a[1])
+                if x > point[0]:
+                    result = not result
+        return result
+
+    def diagonal(i, j):
+        if j == i + 1 or (i == 0 and j == count - 1):
+            return True
+        edge = bm.edges.get((vertices[i], vertices[j]))
+        if edge is not None and (edge.hide or edge.link_faces):
+            return False
+        a, b = coords[i], coords[j]
+        # Exclude crossings, overlapping boundary segments and skipped rim
+        # vertices, so every original rim segment is used exactly once.
+        for k, c in enumerate(coords):
+            if k not in (i, j) and abs(_turn(a, b, c)) <= epsilon:
+                if (c[0] - a[0]) * (c[0] - b[0]) + (c[1] - a[1]) * (c[1] - b[1]) <= epsilon:
+                    return False
+            following = (k + 1) % count
+            if i in (k, following) or j in (k, following):
+                continue
+            d = coords[following]
+            if _turn(a, b, c) * _turn(a, b, d) < 0 and _turn(c, d, a) * _turn(c, d, b) < 0:
+                return False
+        return inside(((a[0] + b[0]) / 2, (a[1] + b[1]) / 2))
+
+    allowed = {(i, j): diagonal(i, j) for i in range(count) for j in range(i + 1, count)}
+    # Each record stores (triangle count, shape cost), its face and subintervals.
+    plans = {(i, i + 1): ((0, 0.0), (), ()) for i in range(count - 1)}
+    for size in range(2, count):
+        for i in range(count - size):
+            j = i + size
+            if not allowed[i, j]:
+                continue
+            best = None
+
+            def consider(indices, children):
+                nonlocal best
+                if any(child not in plans for child in children):
+                    return
+                quality = _face_quality(vertices, coords, orientation, indices)
+                if quality is None:
+                    return
+                score = (int(len(indices) == 3) + sum(plans[child][0][0] for child in children),
+                         quality + sum(plans[child][0][1] for child in children))
+                if best is None or score < best[0]:
+                    best = score, indices, children
+
+            for k in range(i + 1, j):
+                consider((i, k, j), ((i, k), (k, j)))
+                for l in range(k + 1, j):
+                    consider((i, k, l, j), ((i, k), (k, l), (l, j)))
+            if best is not None:
+                plans[i, j] = best
+    if (0, count - 1) not in plans:
+        return None
+    layout = []
+    queue = [(0, count - 1)]
+    while queue:
+        _, indices, children = plans[queue.pop()]
+        if indices:
+            layout.append([vertices[index] for index in indices])
+            queue.extend(reversed(children))
+    return layout
+
+
+def _pair_fill_triangles(bm, vertices, faces):
+    """Maximum quality-constrained matching on a triangulated polygon's dual tree."""
+    coords, orientation = _fill_coordinates(vertices)
+    indices = {v: i for i, v in enumerate(vertices)}
+    adjacency = {face: [] for face in faces}
+    face_set = set(faces)
+    for edge in list(bm.edges):
+        if len(edge.link_faces) != 2 or any(face not in face_set for face in edge.link_faces):
+            continue
+        first, second = edge.link_faces
+        following = {loop.vert: loop.link_loop_next.vert for face in (first, second)
+                     for loop in face.loops if loop.edge != edge}
+        if len(following) != 4:
+            continue
+        start = min(following, key=indices.get)
+        corners = [start]
+        for _ in range(3):
+            corners.append(following[corners[-1]])
+        quality = _face_quality(vertices, coords, orientation, [indices[v] for v in corners])
+        if quality is None:
+            continue
+        pair = first, second, edge, corners
+        adjacency[first].append((second, quality, pair))
+        adjacency[second].append((first, quality, pair))
+
+    visited, selected = set(), []
+    for root in faces:
+        if root in visited:
+            continue
+        # Iterative postorder also handles very large rims without recursion.
+        parent, order = {root: None}, [root]
+        for face in order:
+            visited.add(face)
+            for other, _, _ in adjacency[face]:
+                if other not in parent:
+                    parent[other] = face
+                    order.append(other)
+        states = {}
+        for face in reversed(order):
+            children = [(other, cost, pair) for other, cost, pair in adjacency[face] if parent.get(other) == face]
+            base_score = (sum(states[child][0][0][0] for child, _, _ in children),
+                          sum(states[child][0][0][1] for child, _, _ in children))
+            base_pairs = [pair for child, _, _ in children for pair in states[child][0][1]]
+            free = blocked = base_score, base_pairs
+            for child, cost, pair in children:
+                free_child, blocked_child = states[child]
+                score = (base_score[0] - free_child[0][0] + blocked_child[0][0] + 1,
+                         base_score[1] - free_child[0][1] + blocked_child[0][1] - cost)
+                if score > free[0]:
+                    pairs = [item for other, _, _ in children if other != child for item in states[other][0][1]]
+                    free = score, pairs + blocked_child[1] + [pair]
+            states[face] = free, blocked
+        selected.extend(states[root][0][1])
+    for first, second, edge, corners in selected:
+        material, smooth = first.material_index, first.smooth
+        bm.faces.remove(first)
+        bm.faces.remove(second)
+        bm.edges.remove(edge)
+        quad = bm.faces.new(corners)
+        quad.material_index, quad.smooth = material, smooth
+
+
+def _poor_quads(faces):
+    result = []
+    for face in faces:
+        corners = list(face.verts)
+        if len(corners) == 4:
+            coords, orientation = _fill_coordinates(corners)
+            if _face_quality(corners, coords, orientation, range(4)) is None:
+                result.append(face)
+    return result
+
+
+def _mixed_faces(bm, vertices, edges, material, smooth):
+    if len(vertices) > 16 and len(vertices) % 2:
+        # A dense odd rim needs interior vertices for well-shaped quads. Remove
+        # one valid ear for parity, then grid the rest instead of making a fan
+        # of long, thin boundary-only faces.
+        coords, orientation = _fill_coordinates(vertices)
+        candidates = []
+        for i in range(len(vertices)):
+            indices = ((i - 1) % len(vertices), i, (i + 1) % len(vertices))
+            quality = _face_quality(vertices, coords, orientation, indices)
+            if quality is not None:
+                candidates.append((quality, i))
+        originals = set(bm.verts), set(bm.edges), set(bm.faces)
+        for _, i in sorted(candidates)[:8]:
+            try:
+                ear = bm.faces.new((vertices[i - 1], vertices[i], vertices[(i + 1) % len(vertices)]))
+                ear.material_index, ear.smooth = material, smooth
+                rim = vertices[:i] + vertices[i + 1:]
+                rim_edges = [bm.edges.get((a, b)) for a, b in zip(rim, rim[1:] + rim[:1])]
+                faces = [ear] + list(_grid_faces(bm, rim, rim_edges, material, smooth, balanced=True))
+                _validate_fill(bm, vertices, faces)
+                poor_quads = _poor_quads(faces)
+                if poor_quads:
+                    bmesh.ops.triangulate(bm, faces=poor_quads)
+                    faces = [face for face in bm.faces if face not in originals[2]]
+                    _validate_fill(bm, vertices, faces)
+                return faces
+            except (ValueError, RuntimeError):
+                _remove_fill(bm, originals)
+    layout = _quad_dominant_layout(bm, vertices)
+    if layout is not None:
+        faces = [bm.faces.new(corners) for corners in layout]
+        for face in faces:
+            face.material_index = material
+            face.smooth = smooth
+        return faces
+    original_faces = set(bm.faces)
+    normal = sum((a.co.cross(b.co) for a, b in zip(vertices, vertices[1:] + vertices[:1])), Vector()).normalized()
+    result = bmesh.ops.triangle_fill(bm, edges=edges, normal=normal, use_beauty=True)
+    faces = [item for item in result['geom'] if isinstance(item, bmesh.types.BMFace)]
+    for face in faces:
+        face.material_index = material
+        face.smooth = smooth
+    _pair_fill_triangles(bm, vertices, faces)
+    faces = [face for face in bm.faces if face not in original_faces]
+    return faces
+
+
+def fill_hole(bm, vertices, project=None, quad_only=False):
+    """Prefer a grid, falling back to quads/triangles for irregular and odd rims."""
+    count = len(vertices)
+    if count < 3:
+        raise ValueError("Fill Hole needs at least three rim vertices")
+    if quad_only and (count < 4 or count % 2):
+        raise ValueError("Quads Only needs an even number of rim vertices (at least four)")
+    if len(set(vertices)) != count or any(not v.is_valid or v.hide for v in vertices):
+        raise ValueError("Choose a visible closed hole")
+    edges = [bm.edges.get((a, b)) for a, b in zip(vertices, vertices[1:] + vertices[:1])]
+    if any(e is None or e.hide or len(e.link_faces) > 1 or any(f.hide for f in e.link_faces) for e in edges):
+        raise ValueError("Choose a closed boundary loop")
+    originals = set(bm.verts), set(bm.edges), set(bm.faces)
+    original_verts, _, original_faces = originals
+    reference_face = next((e.link_faces[0] for e in edges if e.link_faces), None)
+    material = reference_face.material_index if reference_face is not None else 0
+    smooth = reference_face.smooth if reference_face is not None else False
+    try:
+        faces = None
+        if count >= 4 and not count % 2:
+            try:
+                faces = _grid_faces(bm, vertices, edges, material, smooth)
+                if any(len(f.verts) != 4 for f in faces):
+                    raise ValueError("This hole cannot form a quad grid")
+                _validate_fill(bm, vertices, faces)
+                if not quad_only:
+                    poor_quads = _poor_quads(faces)
+                    if poor_quads:
+                        if count <= 16:
+                            raise ValueError("This grid would force poor quad shapes")
+                        bmesh.ops.triangulate(bm, faces=poor_quads)
+                        faces = [face for face in bm.faces if face not in original_faces]
+                        _validate_fill(bm, vertices, faces)
+            except (ValueError, RuntimeError):
+                if quad_only:
+                    raise
+                _remove_fill(bm, originals)
+                faces = None
+        if faces is None:
+            faces = _mixed_faces(bm, vertices, edges, material, smooth)
+            _validate_fill(bm, vertices, faces)
+        face_set = set(faces)
+        bmesh.ops.recalc_face_normals(bm, faces=faces)
+        conflicts = []
+        for edge in edges:
+            added = next((f for f in edge.link_faces if f in face_set), None)
+            old = next((f for f in edge.link_faces if f in original_faces), None)
+            if added is None:
+                raise ValueError("The grid does not cover the whole hole")
+            if old is not None:
+                new_loop = next(loop for loop in added.loops if loop.edge == edge)
+                old_loop = next(loop for loop in old.loops if loop.edge == edge)
+                conflicts.append(new_loop.vert == old_loop.vert)
+        if conflicts and all(conflicts):
+            for face in faces:
+                face.normal_flip()
+        elif any(conflicts):
+            raise ValueError("The hole has inconsistent winding. Flip normals first.")
+        if project is not None:
+            for vertex in bm.verts:
+                if vertex not in original_verts:
+                    vertex.co = project(vertex.co)
+        _validate_fill(bm, vertices, faces)
+        if any(len(e.link_faces) > 2 for f in faces for e in f.edges):
+            raise ValueError("Fill Hole would create non-manifold geometry")
+    except Exception:
+        _remove_fill(bm, originals)
+        raise
+    clear_pending(bm)
+    select(bm, None)
+    for face in faces:
+        face.select_set(True)
+    bm.select_history.add(faces[-1])
+    return faces
+
+
+def grid_fill(bm, vertices, project=None):
+    """All-quad variant kept for callers requiring a regular grid."""
+    return fill_hole(bm, vertices, project, quad_only=True)
 
 
 def clear_pending(bm, discard=False):
@@ -216,12 +662,19 @@ class StripPath:
                 points.append(self.cursor.copy())
         return points
 
+    def copy(self):
+        result = StripPath(self.cursor, self.spacing)
+        result.remaining = self.remaining
+        result.points = [point.copy() for point in self.points]
+        return result
 
-def quad_strip(bm, anchor, points, project=None):
+
+def quad_strip(bm, anchor, points, project=None, target=None):
     """Extrude a whole stroke, rolling back geometry if any quad is invalid."""
     if not isinstance(anchor, bmesh.types.BMEdge) or anchor.hide or len(anchor.link_faces) > 1:
         raise ValueError("Select a boundary or loose edge to draw a strip")
     original = set(bm.verts)
+    original_edges = set(bm.edges)
     faces = []
     edge = anchor
     try:
@@ -230,7 +683,21 @@ def quad_strip(bm, anchor, points, project=None):
             faces.append(face)
             corners = list(face.verts)
             edge = bm.edges.get((corners[2], corners[3]))
+        if target is not None:
+            face = bridge(bm, edge, target, finalize=False, repair_winding=False)
+            if edge.link_faces:
+                source = next((f for f in edge.link_faces if f != face), None)
+                if source is not None:
+                    face.material_index = source.material_index
+            faces.append(face)
+            edge = target
     except Exception:
+        for face in faces:
+            if face.is_valid:
+                bm.faces.remove(face)
+        for new_edge in list(bm.edges):
+            if new_edge not in original_edges and not new_edge.link_faces:
+                bm.edges.remove(new_edge)
         created = [v for v in bm.verts if v not in original]
         if created:
             bmesh.ops.delete(bm, geom=created, context='VERTS')
@@ -291,22 +758,23 @@ def extend(bm, anchor, vertex, quad_only=False):
     return vertex
 
 
-def bridge(bm, source, target, quad_only=False):
+def bridge(bm, source, target, quad_only=False, finalize=True, repair_winding=True):
     if source == target or len(source.link_faces) > 1 or len(target.link_faces) > 1:
         raise ValueError("Choose another boundary or loose edge")
     verts = bridge_verts(source, target)
     check_face(bm, verts)
     # Adjacent existing faces must traverse a shared edge in opposite directions.
     if has_target_winding_conflict(target, verts):
-        if not recalculate_face_normals(bm):
+        if not repair_winding or not recalculate_face_normals(bm):
             raise ValueError(WINDING_ERROR)
         verts = bridge_verts(source, target)
         check_face(bm, verts)
         if has_target_winding_conflict(target, verts):
             raise ValueError(WINDING_ERROR)
     face = bm.faces.new(verts)
-    clear_pending(bm)
-    select(bm, target)
+    if finalize:
+        clear_pending(bm)
+        select(bm, target)
     return face
 
 
