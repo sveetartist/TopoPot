@@ -101,14 +101,23 @@ class TopologyTests(unittest.TestCase):
                 self.assertEqual(originals, {v: v.co for v in originals})
                 self.assertTrue(all(len(e.link_faces) <= 2 for e in self.bm.edges))
 
-    def test_fill_hole_mixed_minimizes_triangles_on_odd_rims(self):
+    def test_fill_hole_mixed_odd_rims_use_interior_quads_with_boundary_triangles(self):
         for count in (5, 7, 9, 11, 15):
             with self.subTest(count=count):
                 self.bm.clear()
                 rim = self.hole_ring(count=count)
+                originals = set(self.bm.verts)
                 faces = t.fill_hole(self.bm, rim, quad_only=False)
-                self.assertEqual(sum(len(face.verts) == 3 for face in faces), 1)
-                self.assertEqual(sum(len(face.verts) == 4 for face in faces), (count - 3) // 2)
+                triangles = [face for face in faces if len(face.verts) == 3]
+                self.assertEqual(len(triangles) % 2, 1)
+                self.assertTrue(all(any(v in originals for v in face.verts) for face in triangles))
+                if count >= 7:
+                    interior = [face for face in faces if all(v not in originals for v in face.verts)]
+                    self.assertTrue(interior)
+                    self.assertTrue(all(len(face.verts) == 4 for face in interior))
+                    self.assertTrue(t._square_shaped(interior))
+                else:
+                    self.assertEqual(len(triangles), 1)
 
     def test_fill_hole_mixed_concave_even_rim_uses_quads_without_triangles(self):
         rim = self.hole_polygon([(0, 0), (3, 0), (3, 1), (1, 1), (1, 3), (0, 3)])
@@ -148,6 +157,88 @@ class TopologyTests(unittest.TestCase):
         self.assertTrue(all(len(face.verts) == 4 for face in self.bm.faces))
         self.assertAlmostEqual(sum(face.calc_area() for face in self.bm.faces), 2)
 
+    def test_fill_hole_mixed_unequal_sides_have_uniform_square_interior_and_complete_rim(self):
+        for left_segments in (4, 5):
+            for scale in (0.1, 3.0):
+                with self.subTest(left_segments=left_segments, scale=scale):
+                    self.bm.clear()
+                    coords = [(x, 0) for x in range(7)] + [(6, y) for y in range(1, 5)]
+                    coords += [(x, 4) for x in (4, 2, 0)]
+                    coords += [(0, 4 * i / left_segments) for i in range(left_segments - 1, 0, -1)]
+                    rim = self.hole_polygon(coords, center=(3, 2))
+                    transform = (Matrix.Translation((2, -3, 1)) @ Matrix.Rotation(0.4, 4, 'X')
+                                 @ Matrix.Rotation(0.7, 4, 'Z') @ Matrix.Scale(scale, 4))
+                    for vertex in self.bm.verts:
+                        vertex.co = transform @ vertex.co
+                    positions = {vertex: vertex.co.copy() for vertex in self.bm.verts}
+                    original_edges = set(self.bm.edges)
+                    predicted = retopo_tool.grid_preview(self.bm, rim, quad_only=False)
+                    faces = t.fill_hole(self.bm, rim, quad_only=False)
+                    self.assertEqual(predicted, [[v.co for v in face.verts] for face in faces])
+                    interior = [face for face in faces if all(v not in positions for v in face.verts)]
+                    self.assertGreaterEqual(len(interior), 8)
+                    for face in interior:
+                        self.assertEqual(len(face.verts), 4)
+                        self.assertAlmostEqual(face.calc_area() / scale ** 2, 1, places=4)
+                        vectors = [loop.link_loop_next.vert.co - loop.vert.co for loop in face.loops]
+                        for a, b in zip(vectors, vectors[1:] + vectors[:1]):
+                            self.assertAlmostEqual(a.length / b.length, 1, places=4)
+                            self.assertAlmostEqual(a.normalized().dot(b.normalized()), 0, places=4)
+                    face_set = set(faces)
+                    for a, b in zip(rim, rim[1:] + rim[:1]):
+                        edge = self.bm.edges.get((a, b))
+                        self.assertEqual(sum(face in face_set for face in edge.link_faces), 1)
+                        self.assertEqual(len(edge.link_faces), 2)
+                    self.assertTrue(all(len(e.link_faces) == 2 for e in self.bm.edges if e not in original_edges))
+                    connected, queue = set(), [faces[0]]
+                    while queue:
+                        face = queue.pop()
+                        if face not in connected:
+                            connected.add(face)
+                            queue.extend(other for edge in face.edges for other in edge.link_faces
+                                         if other in face_set and other not in connected)
+                    self.assertEqual(connected, face_set)
+                    self.assertEqual(positions, {v: v.co for v in positions})
+                    self.assertTrue(all(face.material_index == 5 and face.smooth for face in faces))
+                    self.assertAlmostEqual(sum(face.calc_area() for face in faces) / scale ** 2, 24, places=4)
+
+    def test_fill_hole_mixed_concave_dense_rim_keeps_grid_inside_notch(self):
+        coords = [(x, 0) for x in range(7)] + [(6, y) for y in range(1, 4)]
+        coords += [(x, 3) for x in (5, 4, 3)] + [(3, y) for y in (4, 5, 6)]
+        coords += [(x, 6) for x in (2, 1, 0)] + [(0, y) for y in (5, 4, 3, 2, 1)]
+        rim = self.hole_polygon(coords, center=(1, 1))
+        originals = {v: v.co.copy() for v in self.bm.verts}
+        faces = t.fill_hole(self.bm, rim, quad_only=False)
+        interior = [face for face in faces if all(v not in originals for v in face.verts)]
+        self.assertGreaterEqual(len(interior), 6)
+        self.assertTrue(all(len(face.verts) == 4 for face in interior))
+        self.assertTrue(all(abs(face.calc_area() - 1) < 1e-5 for face in interior))
+        self.assertTrue(all(not (face.calc_center_median().x > 3 and face.calc_center_median().y > 3)
+                            for face in faces))
+        self.assertAlmostEqual(sum(face.calc_area() for face in faces), 27, places=4)
+        self.assertEqual(originals, {v: v.co for v in originals})
+        self.assertTrue(all(len(self.bm.edges.get((a, b)).link_faces) == 2
+                            for a, b in zip(rim, rim[1:] + rim[:1])))
+
+    def test_fill_hole_mixed_connects_multiple_interior_grid_patches(self):
+        corners = [(0, 0), (4, 0), (4, 1.5), (6, 1.5), (6, 0), (10, 0),
+                   (10, 4), (6, 4), (6, 2.5), (4, 2.5), (4, 4), (0, 4)]
+        coords = []
+        for a, b in zip(corners, corners[1:] + corners[:1]):
+            delta = Vector(b) - Vector(a)
+            count = int(delta.length + 0.999)
+            coords.extend(tuple(Vector(a) + delta * (i / count)) for i in range(count))
+        rim = self.hole_polygon(coords, center=(5, 2))
+        original_vertices = set(self.bm.verts)
+        faces = t.fill_hole(self.bm, rim, quad_only=False)
+        squares = [face for face in faces if all(v not in original_vertices for v in face.verts)
+                   and len(face.verts) == 4 and abs(face.calc_area() - 1) < 1e-5]
+        self.assertTrue(any(face.calc_center_median().x < 4 for face in squares))
+        self.assertTrue(any(face.calc_center_median().x > 6 for face in squares))
+        self.assertAlmostEqual(sum(face.calc_area() for face in faces), 34, places=4)
+        self.assertTrue(all(len(self.bm.edges.get((a, b)).link_faces) == 2
+                            for a, b in zip(rim, rim[1:] + rim[:1])))
+
     def test_fill_hole_click_requires_ctrl_for_odd_rim(self):
         self.front_view()
         rim = self.hole_ring(count=9)
@@ -164,8 +255,8 @@ class TopologyTests(unittest.TestCase):
             event.ctrl = True
             self.assertEqual(retopo_tool.RP_OT_grid_fill.invoke(op, context, event), {'FINISHED'})
         added = [face for face in self.bm.faces if face.select]
-        self.assertEqual(sum(len(face.verts) == 3 for face in added), 1)
-        self.assertEqual(sum(len(face.verts) == 4 for face in added), 3)
+        self.assertTrue(any(len(face.verts) == 3 for face in added))
+        self.assertTrue(any(len(face.verts) == 4 and all(v not in rim for v in face.verts) for face in added))
         self.assertTrue(context.scene.retopo_tool.quad_only)
 
     def test_fill_hole_mixed_hover_preview_and_click_irregular_hole(self):
@@ -271,7 +362,7 @@ class TopologyTests(unittest.TestCase):
         original = set(self.bm.verts)
         positions = {v: v.co.copy() for v in original}
         snap = lambda co: Vector((co.x, co.y, 0.25))
-        predicted = retopo_tool.grid_preview(self.bm, rim, snap)
+        predicted = retopo_tool.grid_preview(self.bm, rim, snap, quad_only=True)
         faces = t.grid_fill(self.bm, rim, snap)
         self.assertEqual(predicted, [[v.co for v in f.verts] for f in faces])
         self.assertEqual(len(faces), 4)
@@ -450,7 +541,7 @@ class TopologyTests(unittest.TestCase):
         try:
             bpy.context.view_layer.update()
             snap = retopo_tool.reference_projector(context)
-            polygons = retopo_tool.grid_preview(self.bm, rim, snap)
+            polygons = retopo_tool.grid_preview(self.bm, rim, snap, quad_only=True)
             faces = t.grid_fill(self.bm, rim, snap)
             self.assertEqual(polygons, [[v.co for v in f.verts] for f in faces])
             self.assertEqual(positions, {v: v.co for v in original})

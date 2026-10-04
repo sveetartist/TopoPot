@@ -1,5 +1,7 @@
 """BMesh operations shared by the interactive tool and regression tests."""
 import bmesh
+from math import ceil, isfinite, sqrt
+from statistics import median
 from mathutils import Vector
 
 PENDING = "retopo_tool_pending"
@@ -106,6 +108,8 @@ def _validate_fill(bm, vertices, faces):
     """Reject folds and grid layouts which extend beyond a concave rim."""
     if not faces or any(len(f.verts) not in {3, 4} for f in faces):
         raise ValueError("This hole cannot form a valid fill")
+    if any(not isfinite(value) for face in faces for vertex in face.verts for value in vertex.co):
+        raise ValueError("This grid has degenerate coordinates")
     normal = sum((a.co.cross(b.co) for a, b in zip(vertices, vertices[1:] + vertices[:1])), Vector())
     axis = max(range(3), key=lambda index: abs(normal[index]))
     axes = [index for index in range(3) if index != axis]
@@ -146,7 +150,7 @@ def _face_quality(vertices, coords, orientation, indices):
     points = [coords[index] for index in indices]
     lengths = [(b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2
                for a, b in zip(points, points[1:] + points[:1])]
-    if min(lengths) < 1e-16:
+    if any(not isfinite(length) for length in lengths) or min(lengths) < 1e-16:
         return None
     turns = [_turn(points[i - 1], point, points[(i + 1) % len(points)]) * orientation
              for i, point in enumerate(points)]
@@ -250,9 +254,18 @@ def _quad_dominant_layout(bm, vertices):
     return layout
 
 
-def _pair_fill_triangles(bm, vertices, faces):
-    """Maximum quality-constrained matching on a triangulated polygon's dual tree."""
-    coords, orientation = _fill_coordinates(vertices)
+def _pair_fill_triangles(bm, vertices, faces, normal=None):
+    """Match compatible triangle pairs across a triangulated region."""
+    if not faces:
+        return
+    if normal is None:
+        coords, orientation = _fill_coordinates(vertices)
+    else:
+        axis = max(range(3), key=lambda i: abs(normal[i]))
+        axes = [i for i in range(3) if i != axis]
+        coords = [(v.co[axes[0]], v.co[axes[1]]) for v in vertices]
+        points = [(v.co[axes[0]], v.co[axes[1]]) for v in faces[0].verts]
+        orientation = 1 if _turn(*points[:3]) > 0 else -1
     indices = {v: i for i, v in enumerate(vertices)}
     adjacency = {face: [] for face in faces}
     face_set = set(faces)
@@ -323,7 +336,126 @@ def _poor_quads(faces):
     return result
 
 
+def _square_grid_faces(bm, vertices, edges, material, smooth):
+    """Fill the interior with square cells and stitch the remaining rim band."""
+    origin = sum((v.co for v in vertices), Vector()) / len(vertices)
+    normal = sum((a.co.cross(b.co) for a, b in zip(vertices, vertices[1:] + vertices[:1])), Vector())
+    if normal.length < 1e-10:
+        return None
+    normal.normalize()
+    directions = [b.co - a.co for a, b in zip(vertices, vertices[1:] + vertices[:1])]
+    direction = max(directions, key=lambda delta: delta.length_squared)
+    axis_x = (direction - normal * direction.dot(normal)).normalized()
+    axis_y = normal.cross(axis_x)
+    polygon = [Vector(((v.co - origin).dot(axis_x), (v.co - origin).dot(axis_y))) for v in vertices]
+    low = Vector((min(p.x for p in polygon), min(p.y for p in polygon)))
+    high = Vector((max(p.x for p in polygon), max(p.y for p in polygon)))
+    extent = high - low
+    lengths = [(b - a).length for a, b in zip(polygon, polygon[1:] + polygon[:1])]
+    # Match typical rim spacing, with a bounded lattice for responsive hover.
+    spacing = max(median(lengths), extent.x / 128, extent.y / 128,
+                  sqrt(extent.x * extent.y / 4096))
+    if spacing < 1e-8:
+        return None
+    columns, rows = ceil(extent.x / spacing), ceil(extent.y / spacing)
+    start = (low + high) / 2 - Vector((columns, rows)) * (spacing / 2)
+    epsilon = spacing * spacing * 1e-8
+
+    def inside(point):
+        result = False
+        for a, b in zip(polygon, polygon[1:] + polygon[:1]):
+            if (a.y > point.y) != (b.y > point.y):
+                crossing = a.x + (point.y - a.y) * (b.x - a.x) / (b.y - a.y)
+                if point.x < crossing:
+                    result = not result
+        return result
+
+    def clearance(point):
+        distances = []
+        for a, b in zip(polygon, polygon[1:] + polygon[:1]):
+            delta = b - a
+            factor = max(0, min(1, (point - a).dot(delta) / max(delta.length_squared, epsilon)))
+            distances.append((point - a - factor * delta).length)
+        return min(distances)
+
+    cells = set()
+    for x in range(columns):
+        for y in range(rows):
+            lower = start + Vector((x, y)) * spacing
+            upper = lower + Vector((spacing, spacing))
+            corners = [lower, Vector((upper.x, lower.y)), upper, Vector((lower.x, upper.y))]
+            if any(not inside(p) or clearance(p) < spacing * 0.15 for p in corners):
+                continue
+            # Corner tests alone miss narrow concave notches crossing a cell.
+            if any(lower.x <= p.x <= upper.x and lower.y <= p.y <= upper.y for p in polygon):
+                continue
+            if any(_turn(a, b, c) * _turn(a, b, d) < -epsilon * epsilon
+                   and _turn(c, d, a) * _turn(c, d, b) < -epsilon * epsilon
+                   for a, b in zip(polygon, polygon[1:] + polygon[:1])
+                   for c, d in zip(corners, corners[1:] + corners[:1])):
+                continue
+            cells.add((x, y))
+    # Two cells touching only at a corner would create a branched inner rim.
+    for x in range(columns + 1):
+        for y in range(rows + 1):
+            neighbors = cells.intersection({(x - 1, y - 1), (x, y - 1), (x, y), (x - 1, y)})
+            if len(neighbors) == 2:
+                first, second = sorted(neighbors)
+                if first[0] != second[0] and first[1] != second[1]:
+                    cells.remove(second)
+    if not cells:
+        return None
+    originals = set(bm.verts), set(bm.edges), set(bm.faces)
+    grid_vertices = {}
+    try:
+        def vertex(x, y):
+            key = x, y
+            if key not in grid_vertices:
+                point = start + Vector(key) * spacing
+                grid_vertices[key] = bm.verts.new(origin + axis_x * point.x + axis_y * point.y)
+            return grid_vertices[key]
+
+        for x, y in sorted(cells):
+            face = bm.faces.new((vertex(x, y), vertex(x + 1, y), vertex(x + 1, y + 1), vertex(x, y + 1)))
+            face.material_index, face.smooth = material, smooth
+        inner_edges = [edge for edge in bm.edges if edge not in originals[1] and len(edge.link_faces) == 1]
+        result = bmesh.ops.triangle_fill(bm, edges=edges + inner_edges, normal=normal, use_beauty=True)
+        band = [item for item in result['geom'] if isinstance(item, bmesh.types.BMFace)]
+        for face in band:
+            face.material_index, face.smooth = material, smooth
+        _pair_fill_triangles(bm, vertices + list(grid_vertices.values()), band, normal)
+        faces = [face for face in bm.faces if face not in originals[2]]
+        _validate_fill(bm, vertices, faces)
+        fill_faces = set(faces)
+        if (any(len(edge.link_faces) != 2 for edge in inner_edges)
+                or any(sum(face in fill_faces for face in edge.link_faces) != 1 for edge in edges)):
+            raise ValueError("The interior grid does not connect to the whole rim")
+        return faces
+    except (ValueError, RuntimeError):
+        _remove_fill(bm, originals)
+        return None
+
+
+def _square_shaped(faces):
+    """Keep an existing regular grid only when its cells are close to squares."""
+    for face in faces:
+        if len(face.verts) != 4:
+            return False
+        corners = list(face.verts)
+        directions = [b.co - a.co for a, b in zip(corners, corners[1:] + corners[:1])]
+        lengths = [delta.length for delta in directions]
+        if min(lengths) < 1e-8 or max(lengths) > min(lengths) * 1.5:
+            return False
+        if any(abs(a.normalized().dot(b.normalized())) > 0.5
+               for a, b in zip(directions, directions[1:] + directions[:1])):
+            return False
+    return True
+
+
 def _mixed_faces(bm, vertices, edges, material, smooth):
+    faces = _square_grid_faces(bm, vertices, edges, material, smooth)
+    if faces is not None:
+        return faces
     if len(vertices) > 16 and len(vertices) % 2:
         # A dense odd rim needs interior vertices for well-shaped quads. Remove
         # one valid ear for parity, then grid the rest instead of making a fan
@@ -397,6 +529,8 @@ def fill_hole(bm, vertices, project=None, quad_only=False):
                     raise ValueError("This hole cannot form a quad grid")
                 _validate_fill(bm, vertices, faces)
                 if not quad_only:
+                    if not _square_shaped(faces):
+                        raise ValueError("Prefer square interior cells with a boundary transition")
                     poor_quads = _poor_quads(faces)
                     if poor_quads:
                         if count <= 16:

@@ -19,7 +19,7 @@ Edit `topopot_retopo_tool/blender_manifest.toml` to update the version or metada
 Validate the resulting archive using Blender's official validator:
 
 ```sh
-blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.20.0.zip
+blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.20.1.zip
 ```
 
 ## License
@@ -88,13 +88,14 @@ both corner vertices. The four corners are detected from the sharpest rim turns.
 Counts remain visible on invalid fills so you can subdivide or dissolve rim
 vertices to match opposite sides, then hover the hole again to fill it with quads.
 
-Quad/Tri favors quad grids and searches alternative diagonals on smaller irregular
-holes to minimize triangles, then chooses better-shaped quads. Odd rims retain a
-triangle for parity; dense rims can use an interior grid patch. Narrow, concave,
-or folded quad candidates remain triangles instead of forcing poor quads. On
-larger irregular holes, triangle pairs are matched together to avoid stranding
-triangles through greedy joins. The fill follows the actual hole outline,
-including notches, and keeps the existing rim vertices.
+Quad/Tri builds square interior cells sized from the typical rim edge length.
+A transition band of quads and triangles connects the grid to every rim edge,
+including when opposite sides have unequal counts or the total count is odd.
+Regular grids with near-square cells are reused directly. Concave notches stay
+outside the fill; narrow areas that cannot fit square cells use a boundary-based
+quad/triangle layout. Triangles handle the boundary transitions instead of
+stretching long faces across the hole. Existing rim vertices stay in place.
+Reference snapping can deform the square cells to follow a curved surface.
 
 The fill reuses the hole's existing rim vertices and follows the surrounding
 topology. With Snapping enabled and Reference set, new interior vertices project
@@ -227,3 +228,5 @@ menu entry, mode switching, applying the fill to a real Edit Mode mesh, Quads On
 by default, Ctrl press/release preview switching, concave and odd-sided holes,
 quad dominance, sliver rejection, non-greedy triangle pairing, and side vertex
 counts on unequal rims and invalid fills.
+Interior-grid tests cover square cell sizes, rotated and scaled unequal rims,
+complete rim connections, concave notches, and multiple interior grid patches.
