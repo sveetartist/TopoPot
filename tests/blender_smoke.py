@@ -239,6 +239,57 @@ class TopologyTests(unittest.TestCase):
         self.assertTrue(all(len(self.bm.edges.get((a, b)).link_faces) == 2
                             for a, b in zip(rim, rim[1:] + rim[:1])))
 
+    def test_band_connections_replace_far_end_fan_with_nearby_horizontal_rows(self):
+        for angle in (0, 0.7):
+            with self.subTest(angle=angle):
+                self.bm.clear()
+                transform = Matrix.Rotation(angle, 4, 'Z') @ Matrix.Rotation(0.4, 4, 'X')
+                outer = [self.bm.verts.new(transform @ Vector((0, y, 0))) for y in range(7)]
+                inner = [self.bm.verts.new(transform @ Vector((1, y, 0))) for y in range(7)]
+                faces = [self.bm.faces.new((outer[i], outer[i + 1], inner[-1])) for i in range(6)]
+                faces += [self.bm.faces.new((outer[0], inner[i + 1], inner[i])) for i in range(6)]
+                positions = {v: v.co.copy() for v in self.bm.verts}
+                boundary = {e for e in self.bm.edges if len(e.link_faces) == 1}
+                for face in faces:
+                    face.material_index, face.smooth = 3, True
+                band, _ = t._align_band_triangles(self.bm, faces, outer,
+                    transform.to_3x3() @ Vector((1, 0, 0)), transform.to_3x3() @ Vector((0, 1, 0)), 1)
+                for a, b in zip(outer, inner):
+                    self.assertIsNotNone(self.bm.edges.get((a, b)))
+                connections = [e for e in self.bm.edges if (e.verts[0] in outer) != (e.verts[1] in outer)]
+                self.assertTrue(all(e.calc_length() <= 2 ** 0.5 + 1e-5 for e in connections))
+                self.assertEqual(len(band), 12)
+                self.assertAlmostEqual(sum(face.calc_area() for face in band), 6, places=4)
+                self.assertEqual(positions, {v: v.co for v in self.bm.verts})
+                self.assertTrue(all(e.is_valid and len(e.link_faces) == 1 for e in boundary))
+                self.assertTrue(all(face.material_index == 3 and face.smooth for face in band))
+
+    def test_band_connections_prefer_horizontal_when_diagonals_are_equally_short(self):
+        a, b, c, d = [self.v(x, y) for x, y in ((0, 0), (1, 1), (0, 2), (-1, 1))]
+        faces = [self.bm.faces.new((a, b, c)), self.bm.faces.new((a, c, d))]
+        band, _ = t._align_band_triangles(self.bm, faces, [a, c], Vector((1, 0, 0)), Vector((0, 1, 0)), 1)
+        self.assertIsNone(self.bm.edges.get((a, c)))
+        self.assertIsNotNone(self.bm.edges.get((b, d)))
+        self.assertAlmostEqual(sum(face.calc_area() for face in band), 2)
+
+    def test_fill_hole_mixed_limits_rim_connections_to_nearby_grid_vertices(self):
+        corners = [Vector((0, 0)), Vector((10, 0)), Vector((10, 5)), Vector((0, 5))]
+        counts = (13, 4, 7, 8)
+        coords = [tuple(a.lerp(b, i / count))
+                  for a, b, count in zip(corners, corners[1:] + corners[:1], counts) for i in range(count)]
+        rim = self.hole_polygon(coords, center=(5, 2.5))
+        original_vertices = set(self.bm.verts)
+        predicted = retopo_tool.grid_preview(self.bm, rim, quad_only=False)
+        faces = t.fill_hole(self.bm, rim, quad_only=False)
+        self.assertEqual(predicted, [[v.co for v in face.verts] for face in faces])
+        interior = [v for v in self.bm.verts if v not in original_vertices]
+        for edge in self.bm.edges:
+            a, b = edge.verts
+            if (a in rim and b in interior) or (b in rim and a in interior):
+                outer = a if a in rim else b
+                nearest = min((outer.co - v.co).length for v in interior)
+                self.assertLessEqual(edge.calc_length() / nearest, 1.35)
+
     def test_fill_hole_click_requires_ctrl_for_odd_rim(self):
         self.front_view()
         rim = self.hole_ring(count=9)

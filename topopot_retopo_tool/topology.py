@@ -254,7 +254,7 @@ def _quad_dominant_layout(bm, vertices):
     return layout
 
 
-def _pair_fill_triangles(bm, vertices, faces, normal=None):
+def _pair_fill_triangles(bm, vertices, faces, normal=None, flow=None):
     """Match compatible triangle pairs across a triangulated region."""
     if not faces:
         return
@@ -284,6 +284,12 @@ def _pair_fill_triangles(bm, vertices, faces, normal=None):
         quality = _face_quality(vertices, coords, orientation, [indices[v] for v in corners])
         if quality is None:
             continue
+        if flow is not None:
+            # Prefer removing expensive diagonals and pairing poor triangles,
+            # rather than leaving the worst triangle behind to gain a quad.
+            quality -= 2 * flow(*edge.verts)
+            quality -= sum(_face_quality(vertices, coords, orientation, [indices[v] for v in face.verts])
+                           for face in (first, second))
         pair = first, second, edge, corners
         adjacency[first].append((second, quality, pair))
         adjacency[second].append((first, quality, pair))
@@ -334,6 +340,75 @@ def _poor_quads(faces):
             if _face_quality(corners, coords, orientation, range(4)) is None:
                 result.append(face)
     return result
+
+
+def _align_band_triangles(bm, faces, rim, axis_x, axis_y, spacing):
+    """Replace long/skew band diagonals with local connections along grid rows."""
+    face_set = set(faces)
+    vertices = {v for face in faces for v in face.verts}
+    rim_set = set(rim)
+    origin = rim[0].co
+    coords = {v: Vector(((v.co - origin).dot(axis_x), (v.co - origin).dot(axis_y))) for v in vertices}
+    inner = vertices - rim_set
+    nearest = {v: min((coords[v] - coords[other]).length_squared for other in inner)
+               for v in rim_set if v in coords}
+    scale = spacing * spacing
+    epsilon = scale * 1e-8
+
+    def edge_cost(a, b):
+        delta = coords[b] - coords[a]
+        # Keep distance dominant. Straight grid rows win over skew diagonals;
+        # a small horizontal preference breaks otherwise equivalent choices.
+        cost = (delta.length_squared + 2 * min(delta.x ** 2, delta.y ** 2)
+                + 0.1 * delta.y ** 2) / scale
+        if (a in rim_set) != (b in rim_set):
+            outer = a if a in rim_set else b
+            cost += delta.length_squared / max(nearest[outer], epsilon)
+        return cost
+
+    def triangle_cost(corners):
+        points = [coords[v] for v in corners]
+        area = abs(_turn(*points))
+        if area <= epsilon:
+            return float('inf')
+        return sum((b - a).length_squared for a, b in zip(points, points[1:] + points[:1])) / area
+
+    for _ in range(8):
+        changed = False
+        for edge in list(bm.edges):
+            if not edge.is_valid or len(edge.link_faces) != 2:
+                continue
+            first, second = edge.link_faces
+            if first not in face_set or second not in face_set:
+                continue
+            loop = next(loop for loop in first.loops if loop.edge == edge)
+            a, b = loop.vert, loop.link_loop_next.vert
+            c = next(v for v in first.verts if v not in edge.verts)
+            d = next(v for v in second.verts if v not in edge.verts)
+            if c == d or bm.edges.get((c, d)) is not None:
+                continue
+            corners = [coords[v] for v in (c, a, d, b)]
+            turns = [_turn(corners[i - 1], point, corners[(i + 1) % 4])
+                     for i, point in enumerate(corners)]
+            if not (min(turns) > epsilon or max(turns) < -epsilon):
+                continue
+            old = edge_cost(a, b) + 0.2 * (triangle_cost((a, b, c)) + triangle_cost((b, a, d)))
+            new = edge_cost(c, d) + 0.2 * (triangle_cost((c, d, b)) + triangle_cost((d, c, a)))
+            if new >= old - 1e-5:
+                continue
+            material, smooth = first.material_index, first.smooth
+            face_set.difference_update((first, second))
+            bm.faces.remove(first)
+            bm.faces.remove(second)
+            bm.edges.remove(edge)
+            for verts in ((c, d, b), (d, c, a)):
+                face = bm.faces.new(verts)
+                face.material_index, face.smooth = material, smooth
+                face_set.add(face)
+            changed = True
+        if not changed:
+            break
+    return [face for face in bm.faces if face in face_set], edge_cost
 
 
 def _square_grid_faces(bm, vertices, edges, material, smooth):
@@ -423,7 +498,8 @@ def _square_grid_faces(bm, vertices, edges, material, smooth):
         band = [item for item in result['geom'] if isinstance(item, bmesh.types.BMFace)]
         for face in band:
             face.material_index, face.smooth = material, smooth
-        _pair_fill_triangles(bm, vertices + list(grid_vertices.values()), band, normal)
+        band, flow = _align_band_triangles(bm, band, vertices, axis_x, axis_y, spacing)
+        _pair_fill_triangles(bm, vertices + list(grid_vertices.values()), band, normal, flow)
         faces = [face for face in bm.faces if face not in originals[2]]
         _validate_fill(bm, vertices, faces)
         fill_faces = set(faces)

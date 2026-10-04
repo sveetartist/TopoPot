@@ -19,7 +19,7 @@ Edit `topopot_retopo_tool/blender_manifest.toml` to update the version or metada
 Validate the resulting archive using Blender's official validator:
 
 ```sh
-blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.20.1.zip
+blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.20.2.zip
 ```
 
 ## License
@@ -96,6 +96,9 @@ outside the fill; narrow areas that cannot fit square cells use a boundary-based
 quad/triangle layout. Triangles handle the boundary transitions instead of
 stretching long faces across the hole. Existing rim vertices stay in place.
 Reference snapping can deform the square cells to follow a curved surface.
+Boundary connections favor nearby grid vertices and straight grid rows, with a
+horizontal preference in the grid's own orientation when distances are similar.
+Long diagonal fans are adjusted before triangles are paired into quads.
 
 The fill reuses the hole's existing rim vertices and follows the surrounding
 topology. With Snapping enabled and Reference set, new interior vertices project
@@ -230,3 +233,5 @@ quad dominance, sliver rejection, non-greedy triangle pairing, and side vertex
 counts on unequal rims and invalid fills.
 Interior-grid tests cover square cell sizes, rotated and scaled unequal rims,
 complete rim connections, concave notches, and multiple interior grid patches.
+Connection tests cover distant fan replacement, horizontal preference, rotated
+grid rows, and local rim-to-grid distances.
