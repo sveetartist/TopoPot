@@ -434,6 +434,67 @@ class TopologyTests(unittest.TestCase):
                 self.assertEqual(len(faces), count // 2 - 1)
                 self.assertTrue(all(len(f.verts) == 4 for f in faces))
 
+    def test_grid_fill_retries_layout_that_originally_extended_outside_irregular_hole(self):
+        coords = [(0.817, 0), (1.193, 1.193), (0, 1.411), (-0.452, 0.452),
+                  (-1.282, 0), (-1.034, -1.034), (0, -0.664), (1.02, -1.02)]
+        rim = self.hole_polygon(coords, center=(0, 0))
+        originals = {v: v.co.copy() for v in self.bm.verts}
+        predicted = retopo_tool.grid_preview(self.bm, rim, quad_only=True)
+        faces = t.grid_fill(self.bm, rim)
+        self.assertEqual(predicted, [[v.co for v in f.verts] for f in faces])
+        self.assertTrue(all(len(f.verts) == 4 for f in faces))
+        area = abs(sum(a[0] * b[1] - a[1] * b[0] for a, b in zip(coords, coords[1:] + coords[:1]))) / 2
+        self.assertAlmostEqual(sum(f.calc_area() for f in faces), area, places=5)
+        self.assertEqual(originals, {v: v.co for v in originals})
+        self.assertTrue(all(len(self.bm.edges.get((a, b)).link_faces) == 2
+                            for a, b in zip(rim, rim[1:] + rim[:1])))
+
+    def test_grid_fill_uses_valid_all_quad_partition_for_concave_hole(self):
+        rim = self.hole_polygon([(0, 0), (3, 0), (3, 1), (1, 1), (1, 3), (0, 3)])
+        originals = {v: v.co.copy() for v in self.bm.verts}
+        faces = t.grid_fill(self.bm, rim)
+        self.assertEqual(len(faces), 2)
+        self.assertTrue(all(len(f.verts) == 4 for f in faces))
+        self.assertAlmostEqual(sum(f.calc_area() for f in faces), 5)
+        self.assertEqual(originals, {v: v.co for v in originals})
+        self.assertTrue(all(f.material_index == 5 and f.smooth for f in faces))
+
+    def test_grid_fill_far_from_origin_keeps_area_and_rim_connections(self):
+        coords = [(x, 0) for x in range(5)] + [(4, y) for y in (1, 2, 3)]
+        coords += [(x, 3) for x in (3, 2, 1, 0)] + [(0, y) for y in (2, 1)]
+        rim = self.hole_polygon(coords, center=(2, 1.5))
+        offset = Vector((100000, 100000, 100000))
+        for v in self.bm.verts:
+            v.co += offset
+        originals = {v: v.co.copy() for v in self.bm.verts}
+        predicted = retopo_tool.grid_preview(self.bm, rim, quad_only=True)
+        faces = t.grid_fill(self.bm, rim)
+        self.assertEqual(predicted, [[v.co for v in f.verts] for f in faces])
+        self.assertAlmostEqual(sum(f.calc_area() for f in faces), 12)
+        self.assertEqual(originals, {v: v.co for v in originals})
+        self.assertTrue(all(len(self.bm.edges.get((a, b)).link_faces) == 2
+                            for a, b in zip(rim, rim[1:] + rim[:1])))
+
+    def test_fill_validation_still_rejects_faces_outside_concave_hole(self):
+        rim = [self.v(x, y) for x, y in ((0, 0), (3, 0), (3, 1), (1, 1), (1, 3), (0, 3))]
+        corners = [self.v(x, y) for x, y in ((-0.5, -0.5), (3.5, -0.5), (3.5, 3.5), (-0.5, 3.5))]
+        face = self.bm.faces.new(corners)
+        with self.assertRaisesRegex(ValueError, 'folds or extends outside'):
+            t._validate_fill(self.bm, rim, [face])
+
+    def test_quad_grid_failure_explains_mixed_fill_for_fillable_irregular_hole(self):
+        coords = [(0, 0), (4, 0), (4, 1), (3, 1), (3, 3), (2, 3), (1, 3), (0, 3)]
+        rim = self.hole_polygon(coords, center=(1, 1))
+        positions = {v: v.co.copy() for v in self.bm.verts}
+        counts = len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)
+        with self.assertRaisesRegex(ValueError, 'Hold Ctrl for Quad/Tri'):
+            t.grid_fill(self.bm, rim)
+        self.assertEqual(counts, (len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)))
+        faces = t.fill_hole(self.bm, rim, quad_only=False)
+        self.assertTrue(any(len(f.verts) == 4 for f in faces))
+        self.assertAlmostEqual(sum(f.calc_area() for f in faces), 10)
+        self.assertEqual(positions, {v: v.co for v in positions})
+
     def test_grid_fill_odd_rim_is_highlighted_without_edits(self):
         self.front_view()
         rim = self.hole_ring(count=7)

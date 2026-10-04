@@ -19,7 +19,7 @@ Edit `topopot_retopo_tool/blender_manifest.toml` to update the version or metada
 Validate the resulting archive using Blender's official validator:
 
 ```sh
-blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.20.2.zip
+blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.20.3.zip
 ```
 
 ## License
@@ -87,6 +87,9 @@ In Quads Only, numbers beside the rim show each side's vertex count, including
 both corner vertices. The four corners are detected from the sharpest rim turns.
 Counts remain visible on invalid fills so you can subdivide or dissolve rim
 vertices to match opposite sides, then hover the hole again to fill it with quads.
+If the first grid folds, Fill Hole tries alternative corners and simpler
+interpolation, then a valid all-quad partition for irregular holes. If those
+cannot form an all-quad layout, the header suggests holding Ctrl for Quad/Tri.
 
 Quad/Tri builds square interior cells sized from the typical rim edge length.
 A transition band of quads and triangles connects the grid to every rim edge,
@@ -235,3 +238,5 @@ Interior-grid tests cover square cell sizes, rotated and scaled unequal rims,
 complete rim connections, concave notches, and multiple interior grid patches.
 Connection tests cover distant fan replacement, horizontal preference, rotated
 grid rows, and local rim-to-grid distances.
+Grid recovery tests cover alternative layouts, concave all-quad partitions,
+meshes far from the origin, and rejection of fills outside the boundary.

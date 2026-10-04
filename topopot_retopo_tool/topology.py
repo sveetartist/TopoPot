@@ -71,6 +71,12 @@ def rim_sides(coords):
             for start, end in zip(corners, corners[1:] + corners[:1])]
 
 
+def _rim_normal(vertices):
+    origin = vertices[0].co
+    return sum(((a.co - origin).cross(b.co - origin)
+                for a, b in zip(vertices, vertices[1:] + vertices[:1])), Vector())
+
+
 def _grid_faces(bm, vertices, edges, material, smooth, balanced=False):
     count = len(vertices)
     # Pick four corners with opposite sides of equal length. Prefer sharp rim
@@ -82,13 +88,32 @@ def _grid_faces(bm, vertices, edges, material, smooth, balanced=False):
         turns.append(1.0 - incoming.dot(outgoing))
     half = count // 2
     spans = (max(1, count // 4),) if balanced else range(1, half)
-    offset, span = max(((offset, span) for offset in range(count) for span in spans),
-                       key=lambda pair: (round(sum(turns[(pair[0] + step) % count]
-                                                   for step in (0, pair[1], half, half + pair[1])), 4),
-                                         -abs(pair[1] - count / 4), -pair[0]))
-    arcs = [edges[(offset + step) % count] for step in range(span)]
-    arcs += [edges[(offset + half + step) % count] for step in range(span)]
-    return bmesh.ops.grid_fill(bm, edges=arcs, mat_nr=material, use_smooth=smooth)['faces']
+    candidates = sorted(((offset, span) for offset in range(count) for span in spans),
+                        key=lambda pair: (round(sum(turns[(pair[0] + step) % count]
+                                                    for step in (0, pair[1], half, half + pair[1])), 4),
+                                          -abs(pair[1] - count / 4), -pair[0]), reverse=True)
+    originals = set(bm.verts), set(bm.edges), set(bm.faces)
+    seen, layouts, first_error = set(), 0, None
+    for offset, span in candidates:
+        corners = tuple(sorted((offset + step) % count for step in (0, span, half, half + span)))
+        if corners in seen:
+            continue
+        seen.add(corners)
+        layouts += 1
+        if layouts > 12:
+            break
+        arcs = [edges[(offset + step) % count] for step in range(span)]
+        arcs += [edges[(offset + half + step) % count] for step in range(span)]
+        for simple in (False, True):
+            try:
+                faces = bmesh.ops.grid_fill(bm, edges=arcs, mat_nr=material, use_smooth=smooth,
+                                            use_interp_simple=simple)['faces']
+                _validate_fill(bm, vertices, faces)
+                return faces
+            except (ValueError, RuntimeError) as error:
+                first_error = first_error or error
+                _remove_fill(bm, originals)
+    raise first_error or ValueError("This hole cannot form a valid quad grid")
 
 
 def _remove_fill(bm, originals):
@@ -110,11 +135,13 @@ def _validate_fill(bm, vertices, faces):
         raise ValueError("This hole cannot form a valid fill")
     if any(not isfinite(value) for face in faces for vertex in face.verts for value in vertex.co):
         raise ValueError("This grid has degenerate coordinates")
-    normal = sum((a.co.cross(b.co) for a, b in zip(vertices, vertices[1:] + vertices[:1])), Vector())
+    normal = _rim_normal(vertices)
     axis = max(range(3), key=lambda index: abs(normal[index]))
     axes = [index for index in range(3) if index != axis]
+    origin = vertices[0].co
     def projected(vertex):
-        return Vector((vertex.co[axes[0]], vertex.co[axes[1]]))
+        relative = vertex.co - origin
+        return Vector((relative[axes[0]], relative[axes[1]]))
     def cross(a, b):
         return a.x * b.y - a.y * b.x
     polygon = [projected(v) for v in vertices]
@@ -133,10 +160,11 @@ def _validate_fill(bm, vertices, faces):
 
 
 def _fill_coordinates(vertices):
-    normal = sum((a.co.cross(b.co) for a, b in zip(vertices, vertices[1:] + vertices[:1])), Vector())
+    normal = _rim_normal(vertices)
     axis = max(range(3), key=lambda index: abs(normal[index]))
     axes = [index for index in range(3) if index != axis]
-    coords = [(v.co[axes[0]], v.co[axes[1]]) for v in vertices]
+    origin = vertices[0].co
+    coords = [((v.co - origin)[axes[0]], (v.co - origin)[axes[1]]) for v in vertices]
     area = sum(a[0] * b[1] - a[1] * b[0] for a, b in zip(coords, coords[1:] + coords[:1]))
     return coords, 1 if area > 0 else -1
 
@@ -414,7 +442,7 @@ def _align_band_triangles(bm, faces, rim, axis_x, axis_y, spacing):
 def _square_grid_faces(bm, vertices, edges, material, smooth):
     """Fill the interior with square cells and stitch the remaining rim band."""
     origin = sum((v.co for v in vertices), Vector()) / len(vertices)
-    normal = sum((a.co.cross(b.co) for a, b in zip(vertices, vertices[1:] + vertices[:1])), Vector())
+    normal = _rim_normal(vertices)
     if normal.length < 1e-10:
         return None
     normal.normalize()
@@ -568,7 +596,7 @@ def _mixed_faces(bm, vertices, edges, material, smooth):
             face.smooth = smooth
         return faces
     original_faces = set(bm.faces)
-    normal = sum((a.co.cross(b.co) for a, b in zip(vertices, vertices[1:] + vertices[:1])), Vector()).normalized()
+    normal = _rim_normal(vertices).normalized()
     result = bmesh.ops.triangle_fill(bm, edges=edges, normal=normal, use_beauty=True)
     faces = [item for item in result['geom'] if isinstance(item, bmesh.types.BMFace)]
     for face in faces:
@@ -614,11 +642,17 @@ def fill_hole(bm, vertices, project=None, quad_only=False):
                         bmesh.ops.triangulate(bm, faces=poor_quads)
                         faces = [face for face in bm.faces if face not in original_faces]
                         _validate_fill(bm, vertices, faces)
-            except (ValueError, RuntimeError):
-                if quad_only:
-                    raise
+            except (ValueError, RuntimeError) as error:
                 _remove_fill(bm, originals)
                 faces = None
+                if quad_only:
+                    layout = _quad_dominant_layout(bm, vertices)
+                    if layout is None or any(len(corners) != 4 for corners in layout):
+                        raise ValueError("No valid all-quad layout found. Hold Ctrl for Quad/Tri.") from error
+                    faces = [bm.faces.new(corners) for corners in layout]
+                    for face in faces:
+                        face.material_index, face.smooth = material, smooth
+                    _validate_fill(bm, vertices, faces)
         if faces is None:
             faces = _mixed_faces(bm, vertices, edges, material, smooth)
             _validate_fill(bm, vertices, faces)
