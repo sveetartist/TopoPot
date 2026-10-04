@@ -39,7 +39,7 @@ STRIP_COLOR = (1.0, 0.55, 0.1, 1.0)
 STRIP_CONNECT_COLOR = (0.2, 1.0, 0.45, 1.0)
 GRID_COLOR = (0.1, 0.9, 1.0, 1.0)
 GRID_ERROR_COLOR = (1.0, 0.25, 0.15, 1.0)
-GRID_HINT = "Fill Hole | Quads Only | Drag vertex to reshape | Hold Ctrl: Quad/Tri | Left-click inside to fill | Esc / right-click returns to Retopo"
+GRID_HINT = "Fill Hole | Quads Only | Drag vertex to reshape | Hold Ctrl: Quad/Tri | Left-click inside to fill | Esc / right-click returns to Draw"
 
 
 def mesh_filter(self, obj):
@@ -104,7 +104,7 @@ def update_mode(self, context):
 
 class RP_Settings(bpy.types.PropertyGroup):
     preserve_borders: bpy.props.BoolProperty(name="Preserve Borders", description="Relax only interior surface vertices, keeping open borders and loose geometry fixed", default=False)
-    mode: EnumProperty(name="Mode", items=(('RETOPO', "Retopo", "Create and move topology"), ('BRUSH', "Brush", "Move vertices; Shift relaxes"), ('BOX', "Box Select", "Blender's native box selection"), ('GRID', "Fill Hole", "Hover a hole to preview quads; hold Ctrl to allow triangles; left-click to fill")), default='RETOPO', update=update_mode)
+    mode: EnumProperty(name="Mode", items=(('RETOPO', "Draw", "Create and move topology"), ('BRUSH', "Brush", "Move vertices; Shift relaxes"), ('BOX', "Box Select", "Blender's native box selection"), ('GRID', "Fill Hole", "Drag vertices to reshape; hover to preview; hold Ctrl to allow triangles; click inside to fill")), default='RETOPO', update=update_mode)
     quad_only: BoolProperty(name="Quad Mode", description="Extrude quads with the new edge centered at the cursor; allow triangles when connecting neighboring edges", default=False)
     snapping: BoolProperty(name="Snapping", description="Snap to the reference surface and automatically merge nearby vertices", default=True)
     brush_radius: IntProperty(name="Brush Radius", default=75, min=5, max=500, subtype='PIXEL')
@@ -208,6 +208,9 @@ def visible_from_view(context, co, tree, tolerance=1e-5):
     distance = (co - origin).dot(direction)
     if distance <= 0:
         return False
+    # Orthographic origins can be hundreds of units away. Account for the
+    # float precision of BVH hits so a surface vertex does not occlude itself.
+    tolerance = max(tolerance, distance * 5e-7)
     location, _, _, hit_distance = tree.ray_cast(origin, direction)
     return location is None or hit_distance >= distance - tolerance
 
@@ -534,8 +537,10 @@ class RP_OT_grid_fill(bpy.types.Operator):
         mouse = Vector((event.mouse_region_x, event.mouse_region_y))
         vertex = pick(context, bm, mouse, vertices_only=True)
         if vertex is not None:
+            bm.verts.index_update()
             self.obj, self.area, self.region = context.edit_object, context.area, context.region
-            self.vertex, self.original = vertex, vertex.co.copy()
+            self.vertex_index, self.original = vertex.index, vertex.co.copy()
+            self.mesh_counts = len(bm.verts), len(bm.edges), len(bm.faces)
             self.start, self.dragging = mouse, False
             screen = view3d_utils.location_3d_to_region_2d(context.region, context.region_data,
                                                         self.obj.matrix_world @ self.original)
@@ -561,15 +566,24 @@ class RP_OT_grid_fill(bpy.types.Operator):
         return {'FINISHED'}
 
     def modal(self, context, event):
-        if context.mode != 'EDIT_MESH' or context.edit_object != self.obj or not self.vertex.is_valid:
+        if context.mode != 'EDIT_MESH' or context.edit_object != self.obj:
             self.area.header_text_set(None)
             return {'CANCELLED'}
+        # Blender may rebuild the edit BMesh between invoke and modal events.
+        # Reacquire the vertex rather than retaining an invalid BMVert handle.
+        bm = bmesh.from_edit_mesh(self.obj.data)
+        bm.verts.ensure_lookup_table()
+        if self.mesh_counts != (len(bm.verts), len(bm.edges), len(bm.faces)) or self.vertex_index >= len(bm.verts):
+            self.area.header_text_set(GRID_HINT if context.scene.retopo_tool.mode == 'GRID' else None)
+            return {'CANCELLED'}
+        vertex = bm.verts[self.vertex_index]
         if context.scene.retopo_tool.mode != 'GRID' or event.type in {'ESC', 'RIGHTMOUSE'}:
-            self.vertex.co = self.original
+            vertex.co = self.original
             sync(self.obj, destructive=False)
             self.area.header_text_set(GRID_HINT if context.scene.retopo_tool.mode == 'GRID' else None)
             self.area.tag_redraw()
-            return {'CANCELLED'}
+            # Consume the cancel click so it cannot also invoke Leave Fill Hole.
+            return {'FINISHED'} if event.type in {'ESC', 'RIGHTMOUSE'} else {'CANCELLED'}
         release = event.type == 'LEFTMOUSE' and event.value == 'RELEASE'
         if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'} or release:
             mouse = Vector((event.mouse_x - self.region.x, event.mouse_y - self.region.y))
@@ -579,7 +593,7 @@ class RP_OT_grid_fill(bpy.types.Operator):
                 if self.dragging:
                     point = project(context, mouse + self.grab_offset, self.obj.matrix_world @ self.original)
                     if point is not None:
-                        self.vertex.co = self.obj.matrix_world.inverted_safe() @ point
+                        vertex.co = self.obj.matrix_world.inverted_safe() @ point
                         sync(self.obj, destructive=False)
             self.area.tag_redraw()
         if release:
@@ -604,7 +618,7 @@ class RP_OT_grid_stop(bpy.types.Operator):
 
 class RP_OT_click(bpy.types.Operator):
     bl_idname = "mesh.retopo_tool_click"
-    bl_label = "Retopo tool Stroke"
+    bl_label = "Draw Tool Stroke"
     bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
 
     @classmethod
@@ -1032,7 +1046,7 @@ def relax_positions(weighted, preserve_borders=False):
 
 class RP_OT_brush(bpy.types.Operator):
     bl_idname = "mesh.retopo_tool_brush"
-    bl_label = "Retopo Brush Stroke"
+    bl_label = "Draw Tool Brush Stroke"
     bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
 
     @classmethod
@@ -1135,8 +1149,8 @@ class RP_OT_brush_size(bpy.types.Operator):
 
 class RP_OT_mode(bpy.types.Operator):
     bl_idname = "mesh.retopo_tool_mode"
-    bl_label = "Set Retopo Mode"
-    mode: EnumProperty(items=(('RETOPO', "Retopo", ""), ('BRUSH', "Brush", ""), ('BOX', "Box Select", ""), ('GRID', "Fill Hole", "")))
+    bl_label = "Set Draw Tool Mode"
+    mode: EnumProperty(items=(('RETOPO', "Draw", ""), ('BRUSH', "Brush", ""), ('BOX', "Box Select", ""), ('GRID', "Fill Hole", "")))
 
     @classmethod
     def poll(cls, context):
@@ -1149,20 +1163,20 @@ class RP_OT_mode(bpy.types.Operator):
 
 
 class RP_MT_modes(bpy.types.Menu):
-    bl_label = "Retopo Modes"
+    bl_label = "Draw Tool Modes"
     bl_idname = "RP_MT_modes"
 
     def draw(self, context):
         pie = self.layout.menu_pie()
-        for mode, label, icon in (('RETOPO', "Retopo", 'EDITMODE_HLT'), ('BRUSH', "Brush", 'BRUSH_DATA'), ('BOX', "Box Select", 'SELECT_SET'), ('GRID', "Fill Hole", 'MESH_GRID')):
+        for mode, label, icon in (('RETOPO', "Draw", 'EDITMODE_HLT'), ('BRUSH', "Brush", 'BRUSH_DATA'), ('BOX', "Box Select", 'SELECT_SET'), ('GRID', "Fill Hole", 'MESH_GRID')):
             pie.operator("mesh.retopo_tool_mode", text=label, icon=icon,
                          depress=context.scene.retopo_tool.mode == mode).mode = mode
 
 
 class RP_Preferences(bpy.types.AddonPreferences):
     bl_idname = __package__
-    retopo_color_preset: EnumProperty(name="Retopo Color Preset", items=COLOR_PRESET_ITEMS, default='BLUE', update=update_retopo_color_preset)
-    retopo_color: FloatVectorProperty(name="Retopo Color", subtype='COLOR', size=4, min=0, max=1, default=COLOR_PRESETS['BLUE'], update=update_retopo_color)
+    retopo_color_preset: EnumProperty(name="Draw Color Preset", items=COLOR_PRESET_ITEMS, default='BLUE', update=update_retopo_color_preset)
+    retopo_color: FloatVectorProperty(name="Draw Color", subtype='COLOR', size=4, min=0, max=1, default=COLOR_PRESETS['BLUE'], update=update_retopo_color)
     overlay_color: FloatVectorProperty(name="Overlay Color", subtype='COLOR', size=3, min=0, max=1, default=DEFAULT_OVERLAY_COLOR, update=update_overlay_preferences)
     overlay_opacity: FloatProperty(name="Overlay Opacity", subtype='FACTOR', min=0, max=1, default=DEFAULT_OVERLAY_OPACITY, update=update_overlay_preferences)
 
@@ -1173,7 +1187,7 @@ class RP_Preferences(bpy.types.AddonPreferences):
         layout.use_property_decorate = False
 
         colors = layout.box()
-        colors.label(text="Retopo Colors")
+        colors.label(text="Draw Colors")
         colors.prop(self, "retopo_color_preset")
         colors.prop(self, "retopo_color")
 
@@ -1193,7 +1207,7 @@ class RP_Preferences(bpy.types.AddonPreferences):
 
 class RP_OT_hover(bpy.types.Operator):
     bl_idname = "mesh.retopo_tool_hover"
-    bl_label = "Retopo tool Preview"
+    bl_label = "Draw Tool Preview"
     bl_options = {'INTERNAL'}
 
     def invoke(self, context, event):
@@ -1218,7 +1232,7 @@ class RP_Tool(bpy.types.WorkSpaceTool):
     bl_space_type = 'VIEW_3D'
     bl_context_mode = 'EDIT_MESH'
     bl_idname = "retopo_tool.tool"
-    bl_label = "TopoPot"
+    bl_label = "TopoPot Draw Tool"
     bl_description = "Select and drag; Ctrl-click creates, cuts or bridges; Ctrl-drag from a selected boundary edge draws a quad strip"
     bl_icon = TOOL_ICON
     bl_keymap = (
@@ -1249,7 +1263,7 @@ class RP_Tool(bpy.types.WorkSpaceTool):
 
 class RP_OT_activate(bpy.types.Operator):
     bl_idname = "mesh.retopo_tool_activate"
-    bl_label = "Activate Retopo tool"
+    bl_label = "Activate Draw Tool"
     bl_description = "Edit the selected mesh, or create an empty mesh when none is selected"
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -1294,7 +1308,7 @@ class RP_OT_stop(bpy.types.Operator):
 
 
 class RP_PT_panel(bpy.types.Panel):
-    bl_label = "TopoPot - Retopology tool for Blender"
+    bl_label = "TopoPot - Draw Tool for Blender"
     bl_idname = "RP_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'

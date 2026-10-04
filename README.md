@@ -1,4 +1,4 @@
-# TopoPot - Retopo Tool for Blender 
+# TopoPot - Draw Tool for Blender
 
 Minimal retopology add-on for Blender 5.0.
 
@@ -19,7 +19,7 @@ Edit `topopot_retopo_tool/blender_manifest.toml` to update the version or metada
 Validate the resulting archive using Blender's official validator:
 
 ```sh
-blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.21.0.zip
+blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.21.1.zip
 ```
 
 ## License
@@ -29,7 +29,7 @@ GPL-3.0-or-later (GNU General Public License version 3 or any later version).
 ## Use
 
 1. Select the mesh you want to edit in Object Mode. Open the 3D View sidebar
-   with N, choose Retopo, and press Activate Retopo Pool. The selected mesh
+   with N, choose TopoPot, and press Activate Draw Tool. The selected mesh
    enters Edit Mode. With no mesh selected, activation creates an empty mesh.
    Set Reference to a collection when you want projection onto its meshes.
 2. Ctrl-click empty space (or the Reference surface) to place a vertex.
@@ -46,7 +46,7 @@ GPL-3.0-or-later (GNU General Public License version 3 or any later version).
 
 ## Drawing Face Strips
 
-In Retopo mode, select a loose or boundary edge, then hold Ctrl and left-drag
+In Draw mode, select a loose or boundary edge, then hold Ctrl and left-drag
 from the middle of that edge or from empty space to draw a strip of quads.
 The strip follows the dragged path, turns with the stroke, and uses the starting
 edge's width for face spacing. This works with Quad Mode enabled or disabled.
@@ -77,7 +77,7 @@ Preserve Borders pie entry. Point inside a visible hole to preview the filled
 area in cyan; no selection is required. The viewport header shows the fill mode
 and the quad/triangle counts. Left-click inside the hole to apply the preview in one undo step.
 Fill Hole stays active for the next hole. Choose Fill Hole again in the pie, choose another
-mode, or press Esc/right-click to return to Retopo.
+mode, or press Esc/right-click to return to Draw.
 
 Drag a visible vertex while Fill Hole is active to reshape the rim toward a
 rectangle before filling. Release to keep the move in one undo step; Esc or
@@ -90,7 +90,7 @@ side counts. The fill preview refreshes after the mesh changes.
 Quads Only is the default and requires an even number of rim vertices, at least
 four. Hold Ctrl to temporarily switch to Quad/Tri; releasing Ctrl immediately
 restores Quads Only, including when the mouse is stationary. Hold Ctrl while
-clicking to apply the mixed preview. This is independent of Retopo's Quad Mode.
+clicking to apply the mixed preview. This is independent of Draw's Quad Mode.
 In Quads Only, numbers beside the rim show each side's vertex count, including
 both corner vertices. The four corners are detected from the sharpest rim turns.
 Counts remain visible on invalid fills so you can subdivide or dissolve rim
@@ -124,14 +124,14 @@ Preserve Borders remains available in the brush sidebar and tool settings.
 
 ## Cuts and Subdivision
 
-Choose Retopo, Brush, Box Select, or Fill Hole in the Retopo sidebar. Box Select activates
+Choose Draw, Brush, Box Select, or Fill Hole in the TopoPot sidebar. Box Select activates
 Blender's native selection tool, including its normal modifier and X-Ray behavior.
-Choose Retopo or Brush in the sidebar to return from box selection.
-Shift-Alt-Q opens the Retopo Modes pie menu in Mesh Edit Mode, including while
-Box Select is active. Change its shortcut in Preferences > Add-ons > Retopo Pool.
+Choose Draw or Brush in the sidebar to return from box selection.
+Shift-Alt-Q opens the Draw Tool Modes pie menu in Mesh Edit Mode, including while
+Box Select is active. Change its shortcut in Preferences > Add-ons > TopoPot Draw Tool.
 Enable Preserve Borders in the brush sidebar or tool settings to relax only
 interior surface vertices, leaving open borders and loose geometry fixed.
-Enable Prefer Quad in Retopo mode to extrude quads while allowing triangle
+Enable Quad Mode in Draw mode to extrude quads while allowing triangle
 connections between neighboring edges that share a vertex.
 Each click away from the active edge extrudes a complete quad, with the new edge
 centered at the cursor and selected for the next extrusion. Clicking an existing
@@ -251,3 +251,8 @@ meshes far from the origin, and rejection of fills outside the boundary.
 Fill Hole dragging tests cover isolated vertex movement, cancellation, jitter,
 object transforms, reference projection, preserved vertex counts, and reshaping
 a real Edit Mode mesh before filling it.
+Drag tests also cover Blender rebuilding the edit mesh between mouse events.
+For the real event and undo regression, run a separate Blender instance with
+`blender --factory-startup --enable-event-simulate --python tests/blender_ui_smoke.py`.
+It checks dragging, undo/redo, cancellation, and filling after reshaping, writes
+its result to `zips/blender_ui_<major>_<minor>.json`, then exits.
