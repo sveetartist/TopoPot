@@ -19,7 +19,7 @@ Edit `topopot_retopo_tool/blender_manifest.toml` to update the version or metada
 Validate the resulting archive using Blender's official validator:
 
 ```sh
-blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.20.3.zip
+blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.21.0.zip
 ```
 
 ## License
@@ -75,9 +75,17 @@ Ctrl-dragging an interior edge, or an unselected edge, still previews a loop cut
 Open the Shift-Alt-Q pie menu and choose Fill Hole, which replaces the old
 Preserve Borders pie entry. Point inside a visible hole to preview the filled
 area in cyan; no selection is required. The viewport header shows the fill mode
-and the quad/triangle counts. Left-click to apply the preview in one undo step.
+and the quad/triangle counts. Left-click inside the hole to apply the preview in one undo step.
 Fill Hole stays active for the next hole. Choose Fill Hole again in the pie, choose another
 mode, or press Esc/right-click to return to Retopo.
+
+Drag a visible vertex while Fill Hole is active to reshape the rim toward a
+rectangle before filling. Release to keep the move in one undo step; Esc or
+right-click during the drag restores its original position and keeps Fill Hole
+active. A click or small mouse jitter on a vertex leaves the hole unfilled.
+Dragging follows Reference with Snapping enabled; without Reference it moves
+at the vertex's view depth. Vertices do not merge during these drags, preserving
+side counts. The fill preview refreshes after the mesh changes.
 
 Quads Only is the default and requires an even number of rim vertices, at least
 four. Hold Ctrl to temporarily switch to Quad/Tri; releasing Ctrl immediately
@@ -240,3 +248,6 @@ Connection tests cover distant fan replacement, horizontal preference, rotated
 grid rows, and local rim-to-grid distances.
 Grid recovery tests cover alternative layouts, concave all-quad partitions,
 meshes far from the origin, and rejection of fills outside the boundary.
+Fill Hole dragging tests cover isolated vertex movement, cancellation, jitter,
+object transforms, reference projection, preserved vertex counts, and reshaping
+a real Edit Mode mesh before filling it.

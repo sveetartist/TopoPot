@@ -39,7 +39,7 @@ STRIP_COLOR = (1.0, 0.55, 0.1, 1.0)
 STRIP_CONNECT_COLOR = (0.2, 1.0, 0.45, 1.0)
 GRID_COLOR = (0.1, 0.9, 1.0, 1.0)
 GRID_ERROR_COLOR = (1.0, 0.25, 0.15, 1.0)
-GRID_HINT = "Fill Hole | Quads Only | Hold Ctrl: Quad/Tri | Left-click to fill | Esc / right-click returns to Retopo"
+GRID_HINT = "Fill Hole | Quads Only | Drag vertex to reshape | Hold Ctrl: Quad/Tri | Left-click inside to fill | Esc / right-click returns to Retopo"
 
 
 def mesh_filter(self, obj):
@@ -520,8 +520,8 @@ def grid_hover_preview(context, bm, mouse):
 class RP_OT_grid_fill(bpy.types.Operator):
     bl_idname = "mesh.retopo_tool_grid_fill"
     bl_label = "Fill Hole"
-    bl_description = "Fill the hole with quads snapped to Reference; hold Ctrl to allow triangles where needed"
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_description = "Drag vertices to reshape the hole; click inside to fill with quads; hold Ctrl to allow triangles"
+    bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
 
     @classmethod
     def poll(cls, context):
@@ -532,6 +532,17 @@ class RP_OT_grid_fill(bpy.types.Operator):
         track_mouse(context, event)
         bm = bmesh.from_edit_mesh(context.edit_object.data)
         mouse = Vector((event.mouse_region_x, event.mouse_region_y))
+        vertex = pick(context, bm, mouse, vertices_only=True)
+        if vertex is not None:
+            self.obj, self.area, self.region = context.edit_object, context.area, context.region
+            self.vertex, self.original = vertex, vertex.co.copy()
+            self.start, self.dragging = mouse, False
+            screen = view3d_utils.location_3d_to_region_2d(context.region, context.region_data,
+                                                        self.obj.matrix_world @ self.original)
+            self.grab_offset = screen - mouse if screen is not None else Vector((0, 0))
+            self.area.header_text_set("Reshape hole | Drag vertex | Release to keep | Esc / right-click cancels")
+            context.window_manager.modal_handler_add(self)
+            return {'RUNNING_MODAL'}
         vertices = hole_at_mouse(context, bm, mouse)
         if vertices is None:
             self.report({'WARNING'}, "Point inside a visible closed hole")
@@ -548,6 +559,33 @@ class RP_OT_grid_fill(bpy.types.Operator):
         context.area.header_text_set(GRID_HINT)
         context.area.tag_redraw()
         return {'FINISHED'}
+
+    def modal(self, context, event):
+        if context.mode != 'EDIT_MESH' or context.edit_object != self.obj or not self.vertex.is_valid:
+            self.area.header_text_set(None)
+            return {'CANCELLED'}
+        if context.scene.retopo_tool.mode != 'GRID' or event.type in {'ESC', 'RIGHTMOUSE'}:
+            self.vertex.co = self.original
+            sync(self.obj, destructive=False)
+            self.area.header_text_set(GRID_HINT if context.scene.retopo_tool.mode == 'GRID' else None)
+            self.area.tag_redraw()
+            return {'CANCELLED'}
+        release = event.type == 'LEFTMOUSE' and event.value == 'RELEASE'
+        if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'} or release:
+            mouse = Vector((event.mouse_x - self.region.x, event.mouse_y - self.region.y))
+            self.dragging |= (mouse - self.start).length > 3
+            with context.temp_override(area=self.area, region=self.region):
+                track_mouse(context, event)
+                if self.dragging:
+                    point = project(context, mouse + self.grab_offset, self.obj.matrix_world @ self.original)
+                    if point is not None:
+                        self.vertex.co = self.obj.matrix_world.inverted_safe() @ point
+                        sync(self.obj, destructive=False)
+            self.area.tag_redraw()
+        if release:
+            self.area.header_text_set(GRID_HINT)
+            return {'FINISHED'} if self.dragging else {'CANCELLED'}
+        return {'RUNNING_MODAL'}
 
 
 class RP_OT_grid_stop(bpy.types.Operator):
@@ -1169,7 +1207,8 @@ class RP_OT_hover(bpy.types.Operator):
             counts = ', '.join(text for number, text in ((quads, f"{quads} quads"), (triangles, f"{triangles} triangles")) if number)
             fill_mode = 'Quads Only' if fill_quads_only(context) else 'Quad/Tri (Ctrl)'
             hint = 'Hold Ctrl: Quad/Tri' if fill_quads_only(context) else 'Release Ctrl: Quads Only'
-            message = f"Fill Hole | {fill_mode} | {error} | {hint}" if error else f"Fill Hole | {fill_mode} | {counts or 'Hover a hole'} | {hint} | Left-click to fill"
+            message = (f"Fill Hole | {fill_mode} | {error} | Drag vertex to reshape | {hint}" if error else
+                       f"Fill Hole | {fill_mode} | {counts or 'Hover a hole'} | Drag vertex to reshape | {hint} | Left-click inside to fill")
             context.area.header_text_set(message)
         context.area.tag_redraw()
         return {'PASS_THROUGH'}

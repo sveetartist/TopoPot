@@ -47,7 +47,9 @@ class TopologyTests(unittest.TestCase):
             area=SimpleNamespace(type='VIEW_3D', tag_redraw=lambda: None, header_text_set=headers.append, headers=headers),
             region=region, region_data=SimpleNamespace(perspective_matrix=Matrix.Identity(4)),
             scene=SimpleNamespace(retopo_tool=SimpleNamespace(mode='GRID', target=None, snapping=True,
-                offset=0.001, reference_tolerance=12, quad_only=False)), window_manager=SimpleNamespace())
+                offset=0.001, reference_tolerance=12, quad_only=False, radius=0.1)),
+            window_manager=SimpleNamespace(modal_handler_add=lambda op: None),
+            temp_override=lambda **kwargs: nullcontext())
 
     def hole_polygon(self, coords, center=(0.5, 0.5)):
         rim = [self.v(x, y) for x, y in coords]
@@ -535,6 +537,95 @@ class TopologyTests(unittest.TestCase):
         self.assertEqual(context.scene.retopo_tool.mode, 'GRID')
         self.assertIsNone(retopo_tool.hole_at_mouse(context, self.bm, Vector((0, 0))))
 
+    def grid_drag_setup(self, matrix=None):
+        self.front_view()
+        rim = self.hole_ring()
+        for vertex in self.bm.verts:
+            vertex.co *= 20
+        context = self.grid_context()
+        context.scene.retopo_tool.radius = 2
+        if matrix is not None:
+            context.edit_object.matrix_world = matrix
+        vertex = rim[2]
+        world = context.edit_object.matrix_world @ vertex.co
+        start = world.xy + Vector((0.5, 0.5))
+        stroke = SimpleNamespace(report=lambda *args: None)
+        event = self.strip_event('LEFTMOUSE', start, 'PRESS', ctrl=False)
+        with patch.object(retopo_tool.bmesh, 'from_edit_mesh', return_value=self.bm), \
+             patch.object(retopo_tool, 'hole_at_mouse', side_effect=AssertionError('vertex press tried to fill')):
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.invoke(stroke, context, event), {'RUNNING_MODAL'})
+        self.assertEqual(stroke.vertex, vertex)
+        return context, stroke, vertex
+
+    def test_grid_vertex_drag_moves_only_vertex_and_preserves_grip_offset_and_object_transform(self):
+        matrix = Matrix.Translation((10, -5, 2)) @ Matrix.Scale(2, 4)
+        context, stroke, vertex = self.grid_drag_setup(matrix)
+        originals = {v: v.co.copy() for v in self.bm.verts}
+        counts = len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)
+        with patch.object(retopo_tool, 'sync') as sync, \
+             patch.object(retopo_tool, 'project', side_effect=lambda ctx, mouse, depth: Vector((mouse.x, mouse.y, depth.z))):
+            event = self.strip_event('MOUSEMOVE', stroke.start + Vector((8, 6)), ctrl=False)
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(stroke, context, event), {'RUNNING_MODAL'})
+            self.assertEqual(vertex.co, originals[vertex] + Vector((4, 3, 0)))
+            # Release applies the final cursor position even without another move event.
+            event = self.strip_event('LEFTMOUSE', stroke.start + Vector((10, 8)), 'RELEASE', ctrl=False)
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(stroke, context, event), {'FINISHED'})
+            self.assertEqual(vertex.co, originals[vertex] + Vector((5, 4, 0)))
+            self.assertTrue(all(call.kwargs == {'destructive': False} for call in sync.call_args_list))
+        self.assertEqual(counts, (len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)))
+        self.assertTrue(all(v.co == co for v, co in originals.items() if v != vertex))
+        self.assertEqual(context.scene.retopo_tool.mode, 'GRID')
+
+    def test_grid_vertex_drag_cancel_restores_shape_and_stays_in_fill_mode(self):
+        for cancel in ('ESC', 'RIGHTMOUSE', 'MODE_CHANGE'):
+            with self.subTest(cancel=cancel):
+                self.bm.clear()
+                context, stroke, vertex = self.grid_drag_setup()
+                original = vertex.co.copy()
+                with patch.object(retopo_tool, 'sync'), \
+                     patch.object(retopo_tool, 'project', return_value=original + Vector((5, 0, 0))):
+                    event = self.strip_event('MOUSEMOVE', stroke.start + Vector((5, 0)), ctrl=False)
+                    self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(stroke, context, event), {'RUNNING_MODAL'})
+                    self.assertNotEqual(vertex.co, original)
+                    if cancel == 'MODE_CHANGE':
+                        context.scene.retopo_tool.mode = 'RETOPO'
+                    event = self.strip_event(cancel, stroke.start, 'PRESS', ctrl=False)
+                    self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(stroke, context, event), {'CANCELLED'})
+                self.assertEqual(vertex.co, original)
+                if cancel != 'MODE_CHANGE':
+                    self.assertEqual(context.scene.retopo_tool.mode, 'GRID')
+
+    def test_grid_vertex_click_or_jitter_leaves_hole_unfilled(self):
+        context, stroke, vertex = self.grid_drag_setup()
+        original = vertex.co.copy()
+        counts = len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)
+        with patch.object(retopo_tool, 'project', side_effect=AssertionError('jitter moved the vertex')):
+            event = self.strip_event('MOUSEMOVE', stroke.start + Vector((1, 1)), ctrl=False)
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(stroke, context, event), {'RUNNING_MODAL'})
+            event.type, event.value = 'LEFTMOUSE', 'RELEASE'
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(stroke, context, event), {'CANCELLED'})
+        self.assertEqual(vertex.co, original)
+        self.assertEqual(counts, (len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)))
+
+    def test_grid_vertex_drag_uses_reference_projection_without_merging_or_leaving_surface(self):
+        context, stroke, vertex = self.grid_drag_setup()
+        original = vertex.co.copy()
+        target = next(v for v in self.bm.verts if v != vertex)
+        counts = len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)
+        with patch.object(retopo_tool, 'sync'), \
+             patch.object(retopo_tool, 'project', side_effect=[target.co.copy(), None, None]):
+            event = self.strip_event('MOUSEMOVE', stroke.start + Vector((5, 0)), ctrl=True)
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(stroke, context, event), {'RUNNING_MODAL'})
+            self.assertEqual(vertex.co, target.co)
+            self.assertNotEqual(vertex.co, original)
+            event.mouse_x += 5
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(stroke, context, event), {'RUNNING_MODAL'})
+            event.type, event.value = 'LEFTMOUSE', 'RELEASE'
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(stroke, context, event), {'FINISHED'})
+        self.assertEqual(vertex.co, target.co)
+        self.assertTrue(vertex.is_valid and target.is_valid)
+        self.assertEqual(counts, (len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)))
+
     def test_grid_hover_notifies_quad_count_and_cached_preview_invalidates(self):
         self.front_view()
         self.hole_ring()
@@ -684,9 +775,27 @@ class TopologyTests(unittest.TestCase):
             with bpy.context.temp_override(area=area, region=region):
                 self.assertEqual(bpy.ops.mesh.retopo_tool_mode(mode='GRID'), {'FINISHED'})
                 self.assertTrue(retopo_tool.RP_OT_grid_fill.poll(bpy.context))
+                edit_bm = bmesh.from_edit_mesh(mesh)
+                vertex = next(v for v in edit_bm.verts if abs(v.co.x - 1) < 1e-5 and abs(v.co.y) < 1e-5)
+                drag_context = self.grid_context()
+                drag_context.edit_object = obj
+                drag = SimpleNamespace(report=lambda *args: None)
+                press = self.strip_event('LEFTMOUSE', (1, 0), 'PRESS', ctrl=False)
+                with patch.object(retopo_tool, 'pick', return_value=vertex):
+                    self.assertEqual(retopo_tool.RP_OT_grid_fill.invoke(drag, drag_context, press), {'RUNNING_MODAL'})
+                destination = vertex.co + Vector((0.2, 0, 0))
+                with patch.object(retopo_tool, 'project', return_value=destination):
+                    retopo_tool._grid_preview_cache = ('stale',)
+                    move = self.strip_event('MOUSEMOVE', (6, 0), ctrl=False)
+                    self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(drag, drag_context, move), {'RUNNING_MODAL'})
+                    self.assertIsNone(retopo_tool._grid_preview_cache)
+                    move.type, move.value = 'LEFTMOUSE', 'RELEASE'
+                    self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(drag, drag_context, move), {'FINISHED'})
+                self.assertEqual(vertex.co, destination)
                 stroke = SimpleNamespace(report=lambda *args: None)
                 event = self.strip_event('LEFTMOUSE', (0, 0), 'PRESS', ctrl=False)
-                self.assertEqual(retopo_tool.RP_OT_grid_fill.invoke(stroke, bpy.context, event), {'FINISHED'})
+                with patch.object(retopo_tool, 'pick', return_value=None):
+                    self.assertEqual(retopo_tool.RP_OT_grid_fill.invoke(stroke, bpy.context, event), {'FINISHED'})
                 self.assertEqual(len(bmesh.from_edit_mesh(mesh).faces), 12)
                 self.assertEqual(bpy.ops.mesh.retopo_tool_grid_stop(), {'FINISHED'})
                 self.assertEqual(bpy.context.scene.retopo_tool.mode, 'RETOPO')
