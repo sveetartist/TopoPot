@@ -19,7 +19,7 @@ Edit `topopot_retopo_tool/blender_manifest.toml` to update the version or metada
 Validate the resulting archive using Blender's official validator:
 
 ```sh
-blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.21.1.zip
+blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.21.2.zip
 ```
 
 ## License
@@ -84,8 +84,12 @@ rectangle before filling. Release to keep the move in one undo step; Esc or
 right-click during the drag restores its original position and keeps Fill Hole
 active. A click or small mouse jitter on a vertex leaves the hole unfilled.
 Dragging follows Reference with Snapping enabled; without Reference it moves
-at the vertex's view depth. Vertices do not merge during these drags, preserving
-side counts. The fill preview refreshes after the mesh changes.
+at the vertex's view depth. Enable **Merge on Drag** in the Fill Hole sidebar or
+tool settings to snap a dragged vertex onto another within **Merge Radius**.
+The target is highlighted; release to weld into that vertex in one undo step.
+Canceling restores the source without merging. This option works independently
+of Reference Snapping and is off by default to preserve side counts during
+reshaping. The fill preview and side counts refresh after mesh changes.
 
 Quads Only is the default and requires an even number of rim vertices, at least
 four. Hold Ctrl to temporarily switch to Quad/Tri; releasing Ctrl immediately
@@ -252,7 +256,9 @@ Fill Hole dragging tests cover isolated vertex movement, cancellation, jitter,
 object transforms, reference projection, preserved vertex counts, and reshaping
 a real Edit Mode mesh before filling it.
 Drag tests also cover Blender rebuilding the edit mesh between mouse events.
+Merge tests cover snapping without early welding, canceling a merge, and
+releasing away from a previously highlighted target.
 For the real event and undo regression, run a separate Blender instance with
 `blender --factory-startup --enable-event-simulate --python tests/blender_ui_smoke.py`.
-It checks dragging, undo/redo, cancellation, and filling after reshaping, writes
+It checks dragging, merge undo/redo, cancellation, and filling after reshaping, writes
 its result to `zips/blender_ui_<major>_<minor>.json`, then exits.

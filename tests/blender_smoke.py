@@ -22,6 +22,7 @@ class TopologyTests(unittest.TestCase):
         retopo_tool.invalidate_visibility()
         retopo_tool._strip_preview = None
         retopo_tool._strip_target = None
+        retopo_tool._merge_target = None
         self.bm = bmesh.new()
 
     def tearDown(self):
@@ -47,7 +48,7 @@ class TopologyTests(unittest.TestCase):
             area=SimpleNamespace(type='VIEW_3D', tag_redraw=lambda: None, header_text_set=headers.append, headers=headers),
             region=region, region_data=SimpleNamespace(perspective_matrix=Matrix.Identity(4)),
             scene=SimpleNamespace(retopo_tool=SimpleNamespace(mode='GRID', target=None, snapping=True,
-                offset=0.001, reference_tolerance=12, quad_only=False, radius=0.1)),
+                offset=0.001, reference_tolerance=12, quad_only=False, radius=0.1, fill_merge=False, merge_radius=2)),
             window_manager=SimpleNamespace(modal_handler_add=lambda op: None),
             temp_override=lambda **kwargs: nullcontext())
 
@@ -65,6 +66,7 @@ class TopologyTests(unittest.TestCase):
         retopo_tool.register()
         try:
             self.assertFalse(bpy.context.scene.retopo_tool.quad_only)
+            self.assertFalse(bpy.context.scene.retopo_tool.fill_merge)
             self.assertTrue(retopo_tool.fill_quads_only(bpy.context))
             self.assertEqual(bpy.context.scene.retopo_tool.bl_rna.properties['mode'].enum_items['RETOPO'].name, 'Draw')
             self.assertEqual(bpy.context.scene.retopo_tool.bl_rna.properties['mode'].enum_items['GRID'].name, 'Fill Hole')
@@ -556,6 +558,7 @@ class TopologyTests(unittest.TestCase):
              patch.object(retopo_tool, 'hole_at_mouse', side_effect=AssertionError('vertex press tried to fill')):
             self.assertEqual(retopo_tool.RP_OT_grid_fill.invoke(stroke, context, event), {'RUNNING_MODAL'})
         self.assertEqual(stroke.vertex_index, vertex.index)
+        self.bm.verts.ensure_lookup_table()
         return context, stroke, vertex
 
     def test_grid_vertex_drag_moves_only_vertex_and_preserves_grip_offset_and_object_transform(self):
@@ -660,6 +663,68 @@ class TopologyTests(unittest.TestCase):
         self.assertEqual(vertex.co, target.co)
         self.assertTrue(vertex.is_valid and target.is_valid)
         self.assertEqual(counts, (len(self.bm.verts), len(self.bm.edges), len(self.bm.faces)))
+
+    def test_grid_vertex_drag_merge_snaps_then_welds_only_on_release(self):
+        context, stroke, vertex = self.grid_drag_setup()
+        context.scene.retopo_tool.fill_merge = True
+        context.scene.retopo_tool.snapping = False
+        target = self.bm.verts[vertex.index - 1]
+        target_co = target.co.copy()
+        originals = {v: v.co.copy() for v in self.bm.verts if v != vertex}
+        count = len(self.bm.verts)
+        mouse = target_co.xy - stroke.grab_offset
+        with patch.object(retopo_tool.bmesh, 'from_edit_mesh', return_value=self.bm), \
+             patch.object(retopo_tool, 'sync') as sync, \
+             patch.object(retopo_tool, 'project', side_effect=AssertionError('merge target should supply position')):
+            event = self.strip_event('MOUSEMOVE', mouse, ctrl=False)
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(stroke, context, event), {'RUNNING_MODAL'})
+            self.assertEqual(vertex.co, target_co)
+            self.assertEqual(len(self.bm.verts), count)
+            self.assertEqual(retopo_tool._merge_target, (context.region.as_pointer(), target_co))
+            event.type, event.value = 'LEFTMOUSE', 'RELEASE'
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(stroke, context, event), {'FINISHED'})
+            sync.assert_called_with(context.edit_object)
+        self.assertFalse(vertex.is_valid)
+        self.assertTrue(target.is_valid)
+        self.assertEqual(len(self.bm.verts), count - 1)
+        self.assertTrue(all(v.co == co for v, co in originals.items()))
+        self.assertTrue(all(len(e.link_faces) <= 2 for e in self.bm.edges))
+        self.assertTrue(all(f.calc_area() > 0 for f in self.bm.faces))
+        self.assertIsNone(retopo_tool._merge_target)
+        self.assertEqual(context.scene.retopo_tool.mode, 'GRID')
+
+    def test_grid_vertex_drag_merge_cancel_restores_without_welding(self):
+        context, stroke, vertex = self.grid_drag_setup()
+        context.scene.retopo_tool.fill_merge = True
+        target = self.bm.verts[vertex.index - 1]
+        original = vertex.co.copy()
+        count = len(self.bm.verts)
+        mouse = target.co.xy - stroke.grab_offset
+        with patch.object(retopo_tool.bmesh, 'from_edit_mesh', return_value=self.bm), patch.object(retopo_tool, 'sync'):
+            event = self.strip_event('MOUSEMOVE', mouse, ctrl=False)
+            retopo_tool.RP_OT_grid_fill.modal(stroke, context, event)
+            self.assertEqual(vertex.co, target.co)
+            event.type, event.value = 'RIGHTMOUSE', 'PRESS'
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(stroke, context, event), {'FINISHED'})
+        self.assertEqual(vertex.co, original)
+        self.assertEqual(len(self.bm.verts), count)
+        self.assertIsNone(retopo_tool._merge_target)
+
+    def test_grid_vertex_drag_leaving_merge_target_does_not_weld_on_release(self):
+        context, stroke, vertex = self.grid_drag_setup()
+        context.scene.retopo_tool.fill_merge = True
+        target = self.bm.verts[vertex.index - 1]
+        count = len(self.bm.verts)
+        mouse = target.co.xy - stroke.grab_offset
+        with patch.object(retopo_tool.bmesh, 'from_edit_mesh', return_value=self.bm), patch.object(retopo_tool, 'sync'), \
+             patch.object(retopo_tool, 'project', return_value=Vector((50, 50, 0))):
+            retopo_tool.RP_OT_grid_fill.modal(stroke, context, self.strip_event('MOUSEMOVE', mouse, ctrl=False))
+            self.assertIsNotNone(retopo_tool._merge_target)
+            event = self.strip_event('LEFTMOUSE', (50, 50), 'RELEASE', ctrl=False)
+            self.assertEqual(retopo_tool.RP_OT_grid_fill.modal(stroke, context, event), {'FINISHED'})
+        self.assertEqual(len(self.bm.verts), count)
+        self.assertEqual(vertex.co, Vector((50, 50, 0)))
+        self.assertIsNone(retopo_tool._merge_target)
 
     def test_grid_hover_notifies_quad_count_and_cached_preview_invalidates(self):
         self.front_view()

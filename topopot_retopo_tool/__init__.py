@@ -107,6 +107,7 @@ class RP_Settings(bpy.types.PropertyGroup):
     mode: EnumProperty(name="Mode", items=(('RETOPO', "Draw", "Create and move topology"), ('BRUSH', "Brush", "Move vertices; Shift relaxes"), ('BOX', "Box Select", "Blender's native box selection"), ('GRID', "Fill Hole", "Drag vertices to reshape; hover to preview; hold Ctrl to allow triangles; click inside to fill")), default='RETOPO', update=update_mode)
     quad_only: BoolProperty(name="Quad Mode", description="Extrude quads with the new edge centered at the cursor; allow triangles when connecting neighboring edges", default=False)
     snapping: BoolProperty(name="Snapping", description="Snap to the reference surface and automatically merge nearby vertices", default=True)
+    fill_merge: BoolProperty(name="Merge on Drag", description="In Fill Hole, snap a dragged vertex onto another and merge on release", default=False)
     brush_radius: IntProperty(name="Brush Radius", default=75, min=5, max=500, subtype='PIXEL')
     target: PointerProperty(name="Reference", description="Mesh objects in this collection and its child collections provide snapping surfaces", type=bpy.types.Collection)
     offset: FloatProperty(name="Offset", default=0.001, min=0, soft_max=0.1, subtype='DISTANCE')
@@ -537,6 +538,8 @@ class RP_OT_grid_fill(bpy.types.Operator):
         mouse = Vector((event.mouse_region_x, event.mouse_region_y))
         vertex = pick(context, bm, mouse, vertices_only=True)
         if vertex is not None:
+            global _merge_target
+            _merge_target = None
             bm.verts.index_update()
             self.obj, self.area, self.region = context.edit_object, context.area, context.region
             self.vertex_index, self.original = vertex.index, vertex.co.copy()
@@ -566,7 +569,9 @@ class RP_OT_grid_fill(bpy.types.Operator):
         return {'FINISHED'}
 
     def modal(self, context, event):
+        global _merge_target
         if context.mode != 'EDIT_MESH' or context.edit_object != self.obj:
+            _merge_target = None
             self.area.header_text_set(None)
             return {'CANCELLED'}
         # Blender may rebuild the edit BMesh between invoke and modal events.
@@ -574,10 +579,12 @@ class RP_OT_grid_fill(bpy.types.Operator):
         bm = bmesh.from_edit_mesh(self.obj.data)
         bm.verts.ensure_lookup_table()
         if self.mesh_counts != (len(bm.verts), len(bm.edges), len(bm.faces)) or self.vertex_index >= len(bm.verts):
+            _merge_target = None
             self.area.header_text_set(GRID_HINT if context.scene.retopo_tool.mode == 'GRID' else None)
             return {'CANCELLED'}
         vertex = bm.verts[self.vertex_index]
         if context.scene.retopo_tool.mode != 'GRID' or event.type in {'ESC', 'RIGHTMOUSE'}:
+            _merge_target = None
             vertex.co = self.original
             sync(self.obj, destructive=False)
             self.area.header_text_set(GRID_HINT if context.scene.retopo_tool.mode == 'GRID' else None)
@@ -591,12 +598,24 @@ class RP_OT_grid_fill(bpy.types.Operator):
             with context.temp_override(area=self.area, region=self.region):
                 track_mouse(context, event)
                 if self.dragging:
-                    point = project(context, mouse + self.grab_offset, self.obj.matrix_world @ self.original)
+                    settings = context.scene.retopo_tool
+                    target = pick(context, bm, mouse + self.grab_offset, exclude=vertex, vertices_only=True,
+                                  radius=settings.merge_radius) if settings.fill_merge else None
+                    _merge_target = (self.region.as_pointer(), target.co.copy()) if target is not None else None
+                    point = self.obj.matrix_world @ target.co if target is not None else project(
+                        context, mouse + self.grab_offset, self.obj.matrix_world @ self.original)
                     if point is not None:
                         vertex.co = self.obj.matrix_world.inverted_safe() @ point
-                        sync(self.obj, destructive=False)
+                        if release and target is not None:
+                            topology.merge_vertices(bm, vertex, target)
+                            sync(self.obj)
+                        else:
+                            sync(self.obj, destructive=False)
+                    self.area.header_text_set("Reshape hole | Release to merge vertices | Esc / right-click cancels" if target is not None
+                                              else "Reshape hole | Drag vertex | Release to keep | Esc / right-click cancels")
             self.area.tag_redraw()
         if release:
+            _merge_target = None
             self.area.header_text_set(GRID_HINT)
             return {'FINISHED'} if self.dragging else {'CANCELLED'}
         return {'RUNNING_MODAL'}
@@ -1259,6 +1278,9 @@ class RP_Tool(bpy.types.WorkSpaceTool):
             layout.prop(context.scene.retopo_tool, "quad_only")
         elif context.scene.retopo_tool.mode == 'GRID':
             layout.label(text="Quads Only · Hold Ctrl: Quad/Tri")
+            layout.prop(context.scene.retopo_tool, "fill_merge")
+            if context.scene.retopo_tool.fill_merge:
+                layout.prop(context.scene.retopo_tool, "merge_radius")
 
 
 class RP_OT_activate(bpy.types.Operator):
@@ -1331,6 +1353,7 @@ class RP_PT_panel(bpy.types.Panel):
             layout.prop(settings, "quad_only")
         elif settings.mode == 'GRID':
             layout.label(text="Quads Only · Hold Ctrl: Quad/Tri")
+            layout.prop(settings, "fill_merge")
         layout.prop(settings, "target")
         layout.prop(settings, "offset")
         layout.prop(settings, "radius")

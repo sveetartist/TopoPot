@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "topopot_retopo_tool"
-version = "1.21.1"
+version = "1.21.2"
 name = "TopoPot - Draw Tool for Blender"
 tagline = "Minimalistic retopology with quality tools"
 maintainer = "ArtVit"

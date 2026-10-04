@@ -68,7 +68,7 @@ def send(kind, value, point):
 
 step = 0
 def tick():
-    global step, start, moved, second_start, center
+    global step, start, moved, second_start, center, merge_target, target_co
     try:
         trace.append((step, bpy.context.scene.retopo_tool.mode))
         if step == 0:
@@ -106,17 +106,51 @@ def tick():
         elif step == 11:
             assert (geometry().verts[0].co - moved).length < 1e-5, 'Cancel did not restore the vertex'
             assert bpy.context.scene.retopo_tool.mode == 'GRID', 'Cancel left Fill Hole'
+            bpy.context.scene.retopo_tool.fill_merge = True
+            target_co = geometry().verts[1].co.copy()
+            merge_target = view3d_utils.location_3d_to_region_2d(region, view, target_co)
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo_push(message='Merge option enabled')
+            send('MOUSEMOVE', 'NOTHING', second_start)
+        elif step == 12:
+            send('LEFTMOUSE', 'PRESS', second_start)
+        elif step == 13:
+            send('MOUSEMOVE', 'NOTHING', merge_target)
+        elif step == 14:
+            assert len(geometry().verts) == 16, 'Merged before release'
+            assert (geometry().verts[0].co - target_co).length < 1e-5, 'Merge target did not snap'
+            send('LEFTMOUSE', 'RELEASE', merge_target)
+        elif step == 15:
+            assert len(geometry().verts) == 15, 'Drop did not weld the vertices'
+            assert any((v.co - target_co).length < 1e-5 for v in geometry().verts), 'Merge moved target'
+            assert bpy.context.scene.retopo_tool.mode == 'GRID'
+            assert addon._merge_target is None
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo()
+        elif step == 16:
+            assert len(geometry().verts) == 16, 'Merge undo failed'
+            assert (geometry().verts[0].co - moved).length < 1e-5, 'Merge undo lost source position'
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.redo()
+        elif step == 17:
+            assert len(geometry().verts) == 15, 'Merge redo failed'
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo()
+        elif step == 18:
+            assert len(geometry().verts) == 16
+            bpy.context.scene.retopo_tool.fill_merge = False
             center = view3d_utils.location_3d_to_region_2d(region, view, Vector((0, 0, 0)))
             send('MOUSEMOVE', 'NOTHING', center)
-        elif step == 12:
+        elif step == 19:
             send('LEFTMOUSE', 'PRESS', center)
-        elif step == 13:
+        elif step == 20:
             send('LEFTMOUSE', 'RELEASE', center)
         else:
             assert len(geometry().faces) > 8, 'Interior click did not fill the reshaped hole'
             assert bpy.context.scene.retopo_tool.mode == 'GRID'
             report.write_text(json.dumps({'status': 'passed', 'version': bpy.app.version_string,
-                'checks': ['real mouse drag', 'undo', 'redo', 'cancel', 'fill after reshape', 'Draw label']}))
+                'checks': ['real mouse drag', 'undo', 'redo', 'cancel', 'merge on release',
+                           'merge undo/redo', 'fill after reshape', 'Draw label']}))
             bpy.ops.wm.quit_blender()
             return None
         step += 1
