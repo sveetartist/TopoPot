@@ -19,7 +19,7 @@ Edit `topopot_retopo_tool/blender_manifest.toml` to update the version or metada
 Validate the resulting archive using Blender's official validator:
 
 ```sh
-blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.21.2.zip
+blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.21.3.zip
 ```
 
 ## License
@@ -84,12 +84,22 @@ rectangle before filling. Release to keep the move in one undo step; Esc or
 right-click during the drag restores its original position and keeps Fill Hole
 active. A click or small mouse jitter on a vertex leaves the hole unfilled.
 Dragging follows Reference with Snapping enabled; without Reference it moves
-at the vertex's view depth. Enable **Merge on Drag** in the Fill Hole sidebar or
-tool settings to snap a dragged vertex onto another within **Merge Radius**.
+at the vertex's view depth. **Merge on Drag** is enabled by default in the Fill
+Hole sidebar and tool settings. Drag the cursor onto another vertex within
+**Merge Radius** to snap onto it, including when grabbing off the vertex center.
 The target is highlighted; release to weld into that vertex in one undo step.
 Canceling restores the source without merging. This option works independently
-of Reference Snapping and is off by default to preserve side counts during
-reshaping. The fill preview and side counts refresh after mesh changes.
+of Reference Snapping. Disable it to preserve side counts during reshaping.
+The fill preview and side counts refresh after mesh changes.
+
+Drag the middle of an edge to move both endpoints together. Release to keep the
+move; Esc or right-click restores both endpoints. Click an edge without dragging
+to collapse its endpoints into one vertex at the midpoint. Ctrl-click an edge
+to insert a vertex at the clicked position and connect it to the closest visible
+vertex that can form a triangle. The connection splits a neighboring face or
+adds a triangle into the hole. Each gesture is one undo step and keeps Fill Hole
+active. Clicking near an endpoint picks that vertex; use the middle of the edge
+for edge gestures.
 
 Quads Only is the default and requires an even number of rim vertices, at least
 four. Hold Ctrl to temporarily switch to Quad/Tri; releasing Ctrl immediately
@@ -258,7 +268,10 @@ a real Edit Mode mesh before filling it.
 Drag tests also cover Blender rebuilding the edit mesh between mouse events.
 Merge tests cover snapping without early welding, canceling a merge, and
 releasing away from a previously highlighted target.
+Edge tests cover moving and canceling both endpoints, midpoint collapse,
+Ctrl-click triangle creation, face area preservation, and collinear rejection.
 For the real event and undo regression, run a separate Blender instance with
 `blender --factory-startup --enable-event-simulate --python tests/blender_ui_smoke.py`.
-It checks dragging, merge undo/redo, cancellation, and filling after reshaping, writes
+It checks dragging, merging with an off-center grip, edge dragging and collapse,
+Ctrl-click triangle creation, undo/redo, cancellation, and filling after reshaping, writes
 its result to `zips/blender_ui_<major>_<minor>.json`, then exits.

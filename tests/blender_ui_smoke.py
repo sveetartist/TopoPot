@@ -31,6 +31,13 @@ def monitor(method, original):
     return wrapped
 for method in ('invoke', 'modal'):
     setattr(addon.RP_OT_grid_fill, method, monitor(method, getattr(addon.RP_OT_grid_fill, method)))
+original_triangle_target = addon.fill_triangle_target
+def monitor_triangle_target(context, bm, edge, factor):
+    target = original_triangle_target(context, bm, edge, factor)
+    trace.append(('triangle target', factor, [tuple(v.co) for v in edge.verts], tuple(target.co),
+                  addon.topology.edge_triangle_plan(bm, edge, factor, target)[0]))
+    return target
+addon.fill_triangle_target = monitor_triangle_target
 addon.register()
 bpy.context.preferences.view.show_splash = False
 name = 'Fill Hole UI regression'
@@ -53,6 +60,7 @@ view.view_location = (0, 0, 0)
 view.view_distance = 8
 view.view_perspective = 'ORTHO'
 bpy.context.scene.retopo_tool.snapping = False
+bpy.context.scene.retopo_tool.fill_merge = False
 with bpy.context.temp_override(area=area, region=region):
     bpy.ops.mesh.retopo_tool_mode(mode='GRID')
     bpy.ops.ed.undo_push(message='Fill Hole UI baseline')
@@ -62,13 +70,13 @@ def geometry():
     bm.verts.ensure_lookup_table()
     return bm
 
-def send(kind, value, point):
+def send(kind, value, point, ctrl=False):
     bpy.context.window.event_simulate(type=kind, value=value,
-        x=round(region.x + point.x), y=round(region.y + point.y))
+        x=round(region.x + point.x), y=round(region.y + point.y), ctrl=ctrl)
 
 step = 0
 def tick():
-    global step, start, moved, second_start, center, merge_target, target_co
+    global step, start, moved, second_start, center, merge_target, target_co, edge_start, edge_originals, edge_midpoint, ctrl_point
     try:
         trace.append((step, bpy.context.scene.retopo_tool.mode))
         if step == 0:
@@ -93,7 +101,9 @@ def tick():
                 bpy.ops.ed.redo()
         elif step == 6:
             assert (geometry().verts[0].co - moved).length < 1e-5, 'Drag redo failed'
-            second_start = view3d_utils.location_3d_to_region_2d(region, view, moved)
+            # Grab near the edge of Pick Radius; merge follows the cursor even
+            # when the grab offset is larger than Merge Radius.
+            second_start = view3d_utils.location_3d_to_region_2d(region, view, moved) + Vector((13, 0))
             send('MOUSEMOVE', 'NOTHING', second_start)
         elif step == 7:
             send('LEFTMOUSE', 'PRESS', second_start)
@@ -145,18 +155,81 @@ def tick():
             send('LEFTMOUSE', 'PRESS', center)
         elif step == 20:
             send('LEFTMOUSE', 'RELEASE', center)
-        else:
+        elif step == 21:
             assert len(geometry().faces) > 8, 'Interior click did not fill the reshaped hole'
+            assert bpy.context.scene.retopo_tool.mode == 'GRID'
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo()
+        elif step == 22:
+            assert len(geometry().faces) == 8, 'Fill undo failed'
+            edge_originals = [v.co.copy() for v in geometry().verts]
+            edge_midpoint = (edge_originals[1] + edge_originals[2]) * 0.5
+            edge_start = view3d_utils.location_3d_to_region_2d(region, view, edge_midpoint)
+            send('MOUSEMOVE', 'NOTHING', edge_start)
+        elif step == 23:
+            send('LEFTMOUSE', 'PRESS', edge_start)
+        elif step == 24:
+            send('MOUSEMOVE', 'NOTHING', edge_start + Vector((30, 20)))
+        elif step == 25:
+            send('LEFTMOUSE', 'RELEASE', edge_start + Vector((30, 20)))
+        elif step == 26:
+            assert len(geometry().verts) == 16, 'Edge drag changed vertex count'
+            deltas = [v.co - original for v, original in zip(geometry().verts, edge_originals)]
+            assert deltas[1].length > 0.1 and (deltas[1] - deltas[2]).length < 1e-5, 'Edge endpoints did not move together'
+            assert all(d.length < 1e-5 for i, d in enumerate(deltas) if i not in (1, 2)), 'Edge drag moved other vertices'
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo()
+        elif step == 27:
+            assert all((v.co - co).length < 1e-5 for v, co in zip(geometry().verts, edge_originals)), 'Edge drag undo failed'
+            send('MOUSEMOVE', 'NOTHING', edge_start)
+        elif step == 28:
+            send('LEFTMOUSE', 'PRESS', edge_start)
+        elif step == 29:
+            send('LEFTMOUSE', 'RELEASE', edge_start)
+        elif step == 30:
+            assert len(geometry().verts) == 15, 'Edge click did not collapse endpoints'
+            assert any((v.co - edge_midpoint).length < 1e-5 for v in geometry().verts), 'Edge did not collapse to midpoint'
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo()
+        elif step == 31:
+            assert len(geometry().verts) == 16, 'Edge collapse undo failed'
+            send('MOUSEMOVE', 'NOTHING', edge_start)
+        elif step == 32:
+            bm = geometry()
+            edge = bm.edges.get((bm.verts[1], bm.verts[2]))
+            with bpy.context.temp_override(area=area, region=region):
+                factor = addon.edge_parameter(bpy.context, edge, Vector((round(edge_start.x), round(edge_start.y))))
+            ctrl_point = edge.verts[0].co.lerp(edge.verts[1].co, factor)
+            send('LEFTMOUSE', 'PRESS', edge_start, ctrl=True)
+        elif step == 33:
+            send('LEFTMOUSE', 'RELEASE', edge_start, ctrl=True)
+        elif step == 34:
+            bm = geometry()
+            assert len(bm.verts) == 17, 'Ctrl-click did not split edge'
+            vertex = next(v for v in bm.verts if (v.co - ctrl_point).length < 1e-5)
+            assert any(len(f.verts) == 3 and vertex in f.verts for f in bm.faces), 'Ctrl-click did not create triangle'
+            assert len(bm.faces) == 9
+            assert all(len(e.link_faces) <= 2 for e in bm.edges)
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo()
+        else:
+            assert len(geometry().verts) == 16 and len(geometry().faces) == 8, 'Ctrl-click undo failed'
             assert bpy.context.scene.retopo_tool.mode == 'GRID'
             report.write_text(json.dumps({'status': 'passed', 'version': bpy.app.version_string,
                 'checks': ['real mouse drag', 'undo', 'redo', 'cancel', 'merge on release',
-                           'merge undo/redo', 'fill after reshape', 'Draw label']}))
+                           'merge with off-center grip', 'merge undo/redo', 'fill after reshape',
+                           'edge drag', 'edge collapse', 'Ctrl-click edge triangle', 'edge undo', 'Draw label']}))
             bpy.ops.wm.quit_blender()
             return None
         step += 1
         return 0.3
     except Exception:
-        report.write_text(json.dumps({'status': 'failed', 'step': step, 'trace': trace, 'error': traceback.format_exc()}))
+        error = traceback.format_exc()
+        bm = geometry()
+        bm.verts.index_update()
+        report.write_text(json.dumps({'status': 'failed', 'step': step, 'trace': trace, 'error': error,
+                                     'vertices': [tuple(v.co) for v in bm.verts],
+                                     'faces': [[v.index for v in f.verts] for f in bm.faces]}))
         bpy.ops.wm.quit_blender()
         return None
 

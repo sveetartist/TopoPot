@@ -1124,6 +1124,57 @@ def merge_vertices(bm, source, target, discard_pending=False):
     return target
 
 
+def collapse_edge_midpoint(bm, edge):
+    if edge is None or edge.hide or len(edge.link_faces) > 2:
+        raise ValueError("Choose a visible manifold or loose edge")
+    source, target = edge.verts
+    target.co = (source.co + target.co) * 0.5
+    return merge_vertices(bm, source, target)
+
+
+def edge_triangle_plan(bm, edge, factor, target):
+    if edge is None or edge.hide or len(edge.link_faces) > 2 or target.hide or target in edge.verts:
+        raise ValueError("Choose a different visible vertex")
+    factor = max(0.001, min(0.999, factor))
+    point = edge.verts[0].co.lerp(edge.verts[1].co, factor)
+    if (edge.verts[1].co - edge.verts[0].co).cross(target.co - point).length < 1e-10:
+        raise ValueError("The closest vertex is collinear with this edge")
+    common = next((f for f in edge.link_faces if not f.hide and target in f.verts), None)
+    if common is not None:
+        if not any(bm.edges.get((v, target)) in common.edges for v in edge.verts):
+            raise ValueError("Choose a neighboring corner to create a triangle")
+        return 'FACE', common, None
+    if len(edge.link_faces) > 1:
+        raise ValueError("Choose a vertex on a face beside this edge")
+    candidates = []
+    for endpoint in edge.verts:
+        side = bm.edges.get((endpoint, target))
+        if side is None or (not side.hide and len(side.link_faces) < 2):
+            candidates.append((side is None, (endpoint.co - target.co).length_squared, endpoint))
+    if not candidates:
+        raise ValueError("Connection would create a non-manifold edge")
+    return 'FILL', None, min(candidates, key=lambda item: item[:2])[2]
+
+
+def split_edge_triangle(bm, edge, factor, target):
+    """Split at the clicked position and connect to a nearby vertex with a triangle."""
+    kind, face, endpoint = edge_triangle_plan(bm, edge, factor, target)
+    factor = max(0.001, min(0.999, factor))
+    material = edge.link_faces[0].material_index if edge.link_faces else 0
+    smooth = edge.link_faces[0].smooth if edge.link_faces else False
+    _, vertex = bmesh.utils.edge_split(edge, edge.verts[0], factor)
+    if kind == 'FACE':
+        bmesh.utils.face_split(face, vertex, target)
+    else:
+        segment = bm.edges.get((endpoint, vertex))
+        a, b = oriented(segment, target.co)
+        face = bm.faces.new((a, b, target))
+        face.material_index, face.smooth = material, smooth
+    clear_pending(bm)
+    select(bm, vertex)
+    return vertex
+
+
 def loop_plan(edge, factor, project=None):
     if edge.hide or len(edge.link_faces) > 2:
         raise ValueError("Choose an edge in a manifold quad strip")

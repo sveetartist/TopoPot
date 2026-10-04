@@ -39,7 +39,7 @@ STRIP_COLOR = (1.0, 0.55, 0.1, 1.0)
 STRIP_CONNECT_COLOR = (0.2, 1.0, 0.45, 1.0)
 GRID_COLOR = (0.1, 0.9, 1.0, 1.0)
 GRID_ERROR_COLOR = (1.0, 0.25, 0.15, 1.0)
-GRID_HINT = "Fill Hole | Quads Only | Drag vertex to reshape | Hold Ctrl: Quad/Tri | Left-click inside to fill | Esc / right-click returns to Draw"
+GRID_HINT = "Fill Hole | Drag vertices / edges | Click edge: collapse | Ctrl-click edge: triangle | Hold Ctrl inside: Quad/Tri | Esc / right-click returns to Draw"
 
 
 def mesh_filter(self, obj):
@@ -104,10 +104,10 @@ def update_mode(self, context):
 
 class RP_Settings(bpy.types.PropertyGroup):
     preserve_borders: bpy.props.BoolProperty(name="Preserve Borders", description="Relax only interior surface vertices, keeping open borders and loose geometry fixed", default=False)
-    mode: EnumProperty(name="Mode", items=(('RETOPO', "Draw", "Create and move topology"), ('BRUSH', "Brush", "Move vertices; Shift relaxes"), ('BOX', "Box Select", "Blender's native box selection"), ('GRID', "Fill Hole", "Drag vertices to reshape; hover to preview; hold Ctrl to allow triangles; click inside to fill")), default='RETOPO', update=update_mode)
+    mode: EnumProperty(name="Mode", items=(('RETOPO', "Draw", "Create and move topology"), ('BRUSH', "Brush", "Move vertices; Shift relaxes"), ('BOX', "Box Select", "Blender's native box selection"), ('GRID', "Fill Hole", "Drag vertices or edges; click an edge to collapse; Ctrl-click an edge for a triangle; click inside to fill")), default='RETOPO', update=update_mode)
     quad_only: BoolProperty(name="Quad Mode", description="Extrude quads with the new edge centered at the cursor; allow triangles when connecting neighboring edges", default=False)
     snapping: BoolProperty(name="Snapping", description="Snap to the reference surface and automatically merge nearby vertices", default=True)
-    fill_merge: BoolProperty(name="Merge on Drag", description="In Fill Hole, snap a dragged vertex onto another and merge on release", default=False)
+    fill_merge: BoolProperty(name="Merge on Drag", description="In Fill Hole, snap a dragged vertex onto another and merge on release", default=True)
     brush_radius: IntProperty(name="Brush Radius", default=75, min=5, max=500, subtype='PIXEL')
     target: PointerProperty(name="Reference", description="Mesh objects in this collection and its child collections provide snapping surfaces", type=bpy.types.Collection)
     offset: FloatProperty(name="Offset", default=0.001, min=0, soft_max=0.1, subtype='DISTANCE')
@@ -229,7 +229,7 @@ def reference_pick_tolerance(context, co):
     return tolerance
 
 
-def pick(context, bm, mouse, exclude=None, vertices_only=False, radius=None, edges_only=False):
+def pick(context, bm, mouse, exclude=None, vertices_only=False, radius=None, edges_only=False, relaxed_reference=False):
     matrix = context.edit_object.matrix_world
     def build_edit_tree():
         verts = list(bm.verts)
@@ -246,7 +246,7 @@ def pick(context, bm, mouse, exclude=None, vertices_only=False, radius=None, edg
         edit_tree, ref_tree = trees
         return (visible_from_view(context, co, edit_tree) and
                 (ref_tree is None or visible_from_view(context, co, ref_tree,
-                 max(1e-5, context.scene.retopo_tool.offset * 2) if exclude is not None
+                 max(1e-5, context.scene.retopo_tool.offset * 2) if exclude is not None and not relaxed_reference
                  else reference_pick_tolerance(context, co))))
     coords = {}
     best_v, best_e = None, None
@@ -521,10 +521,41 @@ def grid_hover_preview(context, bm, mouse):
     return result
 
 
+def fill_drag_target(context, bm, mouse, vertex, original):
+    # The moving vertex can temporarily cover the target with its own faces.
+    # Test visibility against the shape before the drag, including reference tolerance.
+    current = vertex.co.copy()
+    key = ('edit', object_key(context.edit_object))
+    try:
+        vertex.co = original
+        _visibility_cache.pop(key, None)
+        return pick(context, bm, mouse, exclude=vertex, vertices_only=True,
+                    radius=context.scene.retopo_tool.merge_radius, relaxed_reference=True)
+    finally:
+        vertex.co = current
+        _visibility_cache.pop(key, None)
+
+
+def fill_triangle_target(context, bm, edge, factor):
+    point = context.edit_object.matrix_world @ edge.verts[0].co.lerp(edge.verts[1].co, factor)
+    candidates = sorted((v for v in bm.verts if v not in edge.verts and not v.hide),
+                        key=lambda v: ((context.edit_object.matrix_world @ v.co) - point).length_squared)
+    for vertex in candidates:
+        mouse = view3d_utils.location_3d_to_region_2d(context.region, context.region_data,
+                                                    context.edit_object.matrix_world @ vertex.co)
+        if mouse is not None and pick(context, bm, mouse, vertices_only=True, radius=1) == vertex:
+            try:
+                topology.edge_triangle_plan(bm, edge, factor, vertex)
+                return vertex
+            except ValueError:
+                pass
+    raise ValueError("No nearby visible vertex can form a triangle with this edge")
+
+
 class RP_OT_grid_fill(bpy.types.Operator):
     bl_idname = "mesh.retopo_tool_grid_fill"
     bl_label = "Fill Hole"
-    bl_description = "Drag vertices to reshape the hole; click inside to fill with quads; hold Ctrl to allow triangles"
+    bl_description = "Drag vertices or edges to reshape; click an edge to collapse; Ctrl-click an edge to split and create a triangle; click inside to fill"
     bl_options = {'REGISTER', 'UNDO', 'BLOCKING'}
 
     @classmethod
@@ -533,12 +564,13 @@ class RP_OT_grid_fill(bpy.types.Operator):
                 and context.region and context.region.type == 'WINDOW' and context.scene.retopo_tool.mode == 'GRID')
 
     def invoke(self, context, event):
+        global _merge_target
         track_mouse(context, event)
         bm = bmesh.from_edit_mesh(context.edit_object.data)
         mouse = Vector((event.mouse_region_x, event.mouse_region_y))
         vertex = pick(context, bm, mouse, vertices_only=True)
+        self.edge_drag = False
         if vertex is not None:
-            global _merge_target
             _merge_target = None
             bm.verts.index_update()
             self.obj, self.area, self.region = context.edit_object, context.area, context.region
@@ -549,6 +581,21 @@ class RP_OT_grid_fill(bpy.types.Operator):
                                                         self.obj.matrix_world @ self.original)
             self.grab_offset = screen - mouse if screen is not None else Vector((0, 0))
             self.area.header_text_set("Reshape hole | Drag vertex | Release to keep | Esc / right-click cancels")
+            context.window_manager.modal_handler_add(self)
+            return {'RUNNING_MODAL'}
+        edge = pick(context, bm, mouse, edges_only=True)
+        if edge is not None:
+            _merge_target = None
+            bm.verts.index_update()
+            self.obj, self.area, self.region = context.edit_object, context.area, context.region
+            self.edge_drag = True
+            self.move_indices = tuple(v.index for v in edge.verts)
+            self.move_originals = [v.co.copy() for v in edge.verts]
+            self.mesh_counts = len(bm.verts), len(bm.edges), len(bm.faces)
+            self.start, self.dragging = mouse, False
+            self.edge_ctrl = event.ctrl
+            self.edge_factor = edge_parameter(context, edge, mouse)
+            self.area.header_text_set("Reshape hole | Drag edge | Click: collapse | Ctrl-click: triangle | Esc / right-click cancels")
             context.window_manager.modal_handler_add(self)
             return {'RUNNING_MODAL'}
         vertices = hole_at_mouse(context, bm, mouse)
@@ -570,6 +617,8 @@ class RP_OT_grid_fill(bpy.types.Operator):
 
     def modal(self, context, event):
         global _merge_target
+        if getattr(self, 'edge_drag', False):
+            return RP_OT_grid_fill.modal_edge(self, context, event)
         if context.mode != 'EDIT_MESH' or context.edit_object != self.obj:
             _merge_target = None
             self.area.header_text_set(None)
@@ -599,8 +648,7 @@ class RP_OT_grid_fill(bpy.types.Operator):
                 track_mouse(context, event)
                 if self.dragging:
                     settings = context.scene.retopo_tool
-                    target = pick(context, bm, mouse + self.grab_offset, exclude=vertex, vertices_only=True,
-                                  radius=settings.merge_radius) if settings.fill_merge else None
+                    target = fill_drag_target(context, bm, mouse, vertex, self.original) if settings.fill_merge else None
                     _merge_target = (self.region.as_pointer(), target.co.copy()) if target is not None else None
                     point = self.obj.matrix_world @ target.co if target is not None else project(
                         context, mouse + self.grab_offset, self.obj.matrix_world @ self.original)
@@ -618,6 +666,56 @@ class RP_OT_grid_fill(bpy.types.Operator):
             _merge_target = None
             self.area.header_text_set(GRID_HINT)
             return {'FINISHED'} if self.dragging else {'CANCELLED'}
+        return {'RUNNING_MODAL'}
+
+    def modal_edge(self, context, event):
+        if context.mode != 'EDIT_MESH' or context.edit_object != self.obj:
+            self.area.header_text_set(None)
+            return {'CANCELLED'}
+        bm = bmesh.from_edit_mesh(self.obj.data)
+        bm.verts.ensure_lookup_table()
+        if self.mesh_counts != (len(bm.verts), len(bm.edges), len(bm.faces)):
+            self.area.header_text_set(GRID_HINT)
+            return {'CANCELLED'}
+        verts = [bm.verts[i] for i in self.move_indices]
+        if context.scene.retopo_tool.mode != 'GRID' or event.type in {'ESC', 'RIGHTMOUSE'}:
+            for vertex, original in zip(verts, self.move_originals):
+                vertex.co = original
+            sync(self.obj, destructive=False)
+            self.area.header_text_set(GRID_HINT if context.scene.retopo_tool.mode == 'GRID' else None)
+            self.area.tag_redraw()
+            return {'FINISHED'} if event.type in {'ESC', 'RIGHTMOUSE'} else {'CANCELLED'}
+        release = event.type == 'LEFTMOUSE' and event.value == 'RELEASE'
+        if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'} or release:
+            mouse = Vector((event.mouse_x - self.region.x, event.mouse_y - self.region.y))
+            self.dragging |= (mouse - self.start).length > 3
+            try:
+                with context.temp_override(area=self.area, region=self.region):
+                    track_mouse(context, event)
+                    if self.dragging:
+                        positions = edge_drag_positions(context, self.move_originals, self.start, mouse,
+                                                        reference_projector(context))
+                        for vertex, position in zip(verts, positions):
+                            vertex.co = position
+                        sync(self.obj, destructive=False)
+                    elif release:
+                        edge = bm.edges.get(verts)
+                        if self.edge_ctrl:
+                            factor = self.edge_factor if edge.verts[0] == verts[0] else 1 - self.edge_factor
+                            target = fill_triangle_target(context, bm, edge, factor)
+                            topology.split_edge_triangle(bm, edge, factor, target)
+                        else:
+                            topology.collapse_edge_midpoint(bm, edge)
+                        sync(self.obj)
+            except (ValueError, RuntimeError) as error:
+                if release:
+                    self.report({'WARNING'}, str(error))
+                    self.area.header_text_set(GRID_HINT)
+                    return {'FINISHED'}
+            self.area.tag_redraw()
+        if release:
+            self.area.header_text_set(GRID_HINT)
+            return {'FINISHED'}
         return {'RUNNING_MODAL'}
 
 
@@ -1240,8 +1338,8 @@ class RP_OT_hover(bpy.types.Operator):
             counts = ', '.join(text for number, text in ((quads, f"{quads} quads"), (triangles, f"{triangles} triangles")) if number)
             fill_mode = 'Quads Only' if fill_quads_only(context) else 'Quad/Tri (Ctrl)'
             hint = 'Hold Ctrl: Quad/Tri' if fill_quads_only(context) else 'Release Ctrl: Quads Only'
-            message = (f"Fill Hole | {fill_mode} | {error} | Drag vertex to reshape | {hint}" if error else
-                       f"Fill Hole | {fill_mode} | {counts or 'Hover a hole'} | Drag vertex to reshape | {hint} | Left-click inside to fill")
+            message = (f"Fill Hole | {fill_mode} | {error} | Drag vertices / edges to reshape | {hint}" if error else
+                       f"Fill Hole | {fill_mode} | {counts or 'Hover a hole'} | Drag vertices / edges | Click edge: collapse | Ctrl-click edge: triangle | {hint}")
             context.area.header_text_set(message)
         context.area.tag_redraw()
         return {'PASS_THROUGH'}
