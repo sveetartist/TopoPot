@@ -15,6 +15,7 @@ from . import topology
 # Blender can reload the package after installation while retaining its submodules.
 topology = importlib.reload(topology)
 TOOL_ICON = str(Path(__file__).resolve().parent / "assets" / "retopo_icon")
+REFERENCE_COLLECTION_NAME = "Retopology Reference"
 COLOR_PRESETS = {
     'BLUE': (0.2, 0.65, 1.0, 1.0),
     'GREEN': (0.15, 0.9, 0.65, 1.0),
@@ -1427,8 +1428,40 @@ class RP_OT_stop(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class RP_OT_add_reference(bpy.types.Operator):
+    bl_idname = "mesh.retopo_tool_add_reference"
+    bl_label = "Move Selection to Reference"
+    bl_description = "Move selected meshes into the Reference collection, creating it if needed"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'OBJECT' and any(obj.type == 'MESH' for obj in context.selected_objects)
+
+    def execute(self, context):
+        settings = context.scene.retopo_tool
+        collection = settings.target or bpy.data.collections.get(REFERENCE_COLLECTION_NAME)
+        if collection is None:
+            collection = bpy.data.collections.new(REFERENCE_COLLECTION_NAME)
+
+        if collection != context.scene.collection and collection not in context.scene.collection.children_recursive:
+            context.scene.collection.children.link(collection)
+
+        for obj in tuple(context.selected_objects):
+            if obj.type != 'MESH':
+                continue
+            if obj.name not in collection.objects:
+                collection.objects.link(obj)
+            for source in tuple(obj.users_collection):
+                if source != collection:
+                    source.objects.unlink(obj)
+
+        settings.target = collection
+        return {'FINISHED'}
+
+
 class RP_PT_panel(bpy.types.Panel):
-    bl_label = "TopoPot - Draw Tool for Blender"
+    bl_label = "TopoPot - Retopology Tool for Blender"
     bl_idname = "RP_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
@@ -1453,6 +1486,7 @@ class RP_PT_panel(bpy.types.Panel):
             layout.label(text="Quads Only · Hold Ctrl: Quad/Tri")
             layout.prop(settings, "fill_merge")
         layout.prop(settings, "target")
+        layout.operator("mesh.retopo_tool_add_reference", icon='OUTLINER_COLLECTION')
         layout.prop(settings, "offset")
         layout.prop(settings, "radius")
         layout.prop(settings, "merge_radius")
@@ -1597,7 +1631,7 @@ def draw_hover():
         gpu.state.blend_set('NONE')
 
 
-classes = (RP_Settings, RP_OT_grid_fill, RP_OT_grid_stop, RP_OT_click, RP_OT_brush, RP_OT_brush_size, RP_OT_mode, RP_MT_modes, RP_Preferences, RP_OT_hover, RP_OT_activate, RP_OT_stop, RP_PT_panel)
+classes = (RP_Settings, RP_OT_grid_fill, RP_OT_grid_stop, RP_OT_click, RP_OT_brush, RP_OT_brush_size, RP_OT_mode, RP_MT_modes, RP_Preferences, RP_OT_hover, RP_OT_activate, RP_OT_stop, RP_OT_add_reference, RP_PT_panel)
 _draw_handle = None
 _addon_keymaps = []
 

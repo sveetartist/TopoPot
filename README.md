@@ -19,7 +19,7 @@ Edit `topopot_retopo_tool/blender_manifest.toml` to update the version or metada
 Validate the resulting archive using Blender's official validator:
 
 ```sh
-blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.21.3.zip
+blender --factory-startup --command extension validate zips/topopot_retopo_tool-1.1.0.zip
 ```
 
 ## License
@@ -32,6 +32,8 @@ GPL-3.0-or-later (GNU General Public License version 3 or any later version).
    with N, choose TopoPot, and press Activate Draw Tool. The selected mesh
    enters Edit Mode. With no mesh selected, activation creates an empty mesh.
    Set Reference to a collection when you want projection onto its meshes.
+   In Object Mode, select reference meshes and click Move Selection to Reference
+   to move them into a reference collection and assign it to Reference.
 2. Ctrl-click empty space (or the Reference surface) to place a vertex.
    Ctrl-click again to create an edge.
 3. From a selected edge, Ctrl-click a third corner to create a triangle.
