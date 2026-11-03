@@ -3,6 +3,7 @@ import bmesh
 from math import ceil, isfinite, sqrt
 from statistics import median
 from mathutils import Vector
+from mathutils.kdtree import KDTree
 
 PENDING = "retopo_tool_pending"
 BASE = "retopo_tool_base"
@@ -714,14 +715,14 @@ def clear_pending(bm, discard=False):
                 item[layer] = 0
 
 
-def pending(bm):
+def pending(bm, anchor=None):
     layer = bm.faces.layers.int.get(PENDING)
     base = bm.edges.layers.int.get(BASE)
     if layer and base:
         for face in bm.faces:
             if face[layer] and len(face.verts) == 3:
                 for loop in face.loops:
-                    if loop.edge[base]:
+                    if loop.edge[base] and (anchor is None or loop.edge == anchor):
                         return face, loop.vert, loop.link_loop_next.vert, loop.link_loop_prev.vert
     return None
 
@@ -762,12 +763,17 @@ def check_face(bm, verts, replacing=None):
         other = (verts[2].co - verts[0].co).cross(verts[3].co - verts[0].co)
         if other.length < 1e-10 or normal.dot(other) <= 0:
             raise ValueError("Place the fourth corner without crossing the face")
-    for face in bm.faces:
-        if face != replacing and set(face.verts) == set(verts):
-            raise ValueError("That face already exists")
+    # A duplicate face shares every edge, so it is enough to inspect the faces
+    # attached to this face's edges instead of scanning the whole mesh.
+    wanted = set(verts)
     for a, b in zip(verts, verts[1:] + verts[:1]):
         edge = bm.edges.get((a, b))
-        if edge and sum(face != replacing for face in edge.link_faces) >= 2:
+        if edge is None:
+            continue
+        for face in edge.link_faces:
+            if face != replacing and len(face.verts) == len(verts) and set(face.verts) == wanted:
+                raise ValueError("That face already exists")
+        if sum(face != replacing for face in edge.link_faces) >= 2:
             raise ValueError("Connection would create a non-manifold edge")
 
 
@@ -874,60 +880,308 @@ def extrude_quad(bm, anchor, point, target=None, project=None, finalize=True):
 
 
 class StripPath:
-    """Resample a cursor polyline at the starting edge's width."""
+    """Evenly sampled trace of a stroke. Faces are about one starting-edge width long."""
+    MIN_FACE = 0.6
+
     def __init__(self, start, spacing):
         if spacing <= 1e-8:
             raise ValueError("The starting edge is too short")
         self.spacing = spacing
-        self.cursor = start.copy()
-        self.remaining = spacing
-        self.points = []
+        self.trail = [start.copy()]
+        self.lengths = []
+        self.total = 0.0
+
+    def length(self):
+        return self.total
+
+    def _append(self, point):
+        length = (point - self.trail[-1]).length
+        self.trail.append(point.copy())
+        self.lengths.append(length)
+        self.total += length
 
     def add(self, point):
-        start = self.cursor
-        delta = point - start
-        length = delta.length
-        if length <= 1e-10:
+        """Extend the trace, or trim it back when the cursor retraces it."""
+        if len(self.trail) < 2:
+            if (point - self.trail[-1]).length > 1e-9:
+                self._append(point)
             return
-        direction = delta / length
-        while length >= self.remaining:
-            start = start + direction * self.remaining
-            self.points.append(start.copy())
-            length -= self.remaining
-            self.remaining = self.spacing
-        self.remaining -= length
-        self.cursor = point.copy()
+        # Trimming is measured against the drawn strip: its faces reach half a
+        # face width to either side of the stroke, plus slack for hand drift.
+        tolerance = self.spacing * 1.25
+        closest = None
+        arc = 0.0
+        for index, length in enumerate(self.lengths):
+            a, b = self.trail[index], self.trail[index + 1]
+            delta = b - a
+            length_sq = delta.length_squared
+            if length_sq <= 1e-20:
+                arc += length
+                continue
+            t = max(0.0, min(1.0, (point - a).dot(delta) / length_sq))
+            foot = a.lerp(b, t)
+            distance = (point - foot).length
+            if closest is None or distance < closest[0]:
+                closest = (distance, index, foot, arc + t * delta.length)
+            arc += length
+        end = self.trail[-1]
+        tangent = end - self.trail[-2]
+        step_length = tangent.length
+        if step_length > 1e-12:
+            tangent = tangent / step_length
+            delta = point - end
+            along = delta.dot(tangent)
+            lateral = (delta - tangent * along).length
+            # Ignore mostly sideways hand jitter at the tip instead of branching
+            # over the strip, while still following the stroke in small increments.
+            dead = max(1e-9, min(step_length * 0.25, self.spacing * 0.02))
+        else:
+            along, lateral, dead = 0.0, 0.0, 1e-9
+        if closest is None:
+            if (point - end).length > 1e-9:
+                self._append(point)
+            return
+        distance, index, foot, arc = closest
+        if along < -dead:
+            # Dragging back over the strip shortens it, even by tiny steps.
+            # At or beyond the start there is nothing left to branch from.
+            if distance <= tolerance or arc <= 1e-9:
+                if arc < self.total - 1e-9:
+                    self._trim(index, foot)
+                return
+            if (point - end).length > 1e-9:
+                self._append(point)
+            return
+        if along > dead and along > lateral * 0.5:
+            if (point - end).length > 1e-9:
+                self._append(point)
+
+    def _trim(self, index, foot):
+        direction = self.trail[1] - self.trail[0] if len(self.trail) > 1 else None
+        self.trail = self.trail[:index + 1]
+        self.lengths = self.lengths[:index]
+        if (foot - self.trail[-1]).length > 1e-9:
+            self.lengths.append((foot - self.trail[-1]).length)
+            self.trail.append(foot.copy())
+        if len(self.trail) < 2:
+            # Keep a tiny directional stub so the next move can still tell a
+            # forward extension from dragging past the start.
+            if direction is not None and direction.length > 1e-12:
+                stub = self.trail[0] + direction.normalized() * 1e-6
+            else:
+                stub = self.trail[0].copy()
+            self.lengths = [(stub - self.trail[0]).length]
+            self.trail.append(stub)
+        self.total = sum(self.lengths)
+
+    def point_at(self, distance):
+        for index, length in enumerate(self.lengths):
+            if length > 1e-10 and distance <= length:
+                return self.trail[index].lerp(self.trail[index + 1], distance / length)
+            distance -= length
+        return self.trail[-1].copy()
 
     def positions(self):
-        points = [point.copy() for point in self.points]
-        # Avoid a tiny final face when release is very close to a sample.
-        if self.spacing - self.remaining > self.spacing * 0.1:
-            if not points or (points[-1] - self.cursor).length > self.spacing * 0.1:
-                points.append(self.cursor.copy())
+        """Fixed-distance rows plus a moving tip, without redistributing history."""
+        total = self.total
+        if total < self.spacing * self.MIN_FACE:
+            return []
+        # Only split the tip once the next face has enough length. Until then
+        # it stretches from 0.6 to 1.6 widths, avoiding slivers and keeping every
+        # completed row at its original arc distance as the stroke grows.
+        count = max(1, int(total / self.spacing + 1.0 - self.MIN_FACE + 1e-6))
+        points = []
+        index, consumed = 0, 0.0
+        for sample in range(1, count + 1):
+            target = self.spacing * sample if sample < count else total
+            while index < len(self.lengths):
+                length = self.lengths[index]
+                if length <= 1e-12 or consumed + length < target:
+                    consumed += length
+                    index += 1
+                    continue
+                break
+            if index >= len(self.lengths):
+                points.append(self.trail[-1].copy())
+                continue
+            length = self.lengths[index]
+            t = max(0.0, min(1.0, (target - consumed) / length))
+            points.append(self.trail[index].lerp(self.trail[index + 1], t))
         return points
 
     def copy(self):
-        result = StripPath(self.cursor, self.spacing)
-        result.remaining = self.remaining
-        result.points = [point.copy() for point in self.points]
+        result = StripPath(self.trail[0], self.spacing)
+        result.trail = [point.copy() for point in self.trail]
+        result.lengths = list(self.lengths)
+        result.total = self.total
         return result
 
 
-def quad_strip(bm, anchor, points, project=None, target=None):
+def _has_face_winding_conflict(bm, verts, replacing=None):
+    for a, b in zip(verts, verts[1:] + verts[:1]):
+        edge = bm.edges.get((a, b))
+        if edge is None:
+            continue
+        for other in edge.link_faces:
+            if other == replacing or other.hide:
+                continue
+            loop = next(l for l in other.loops if l.edge == edge)
+            if loop.vert == a and loop.link_loop_next.vert == b:
+                return True
+    return False
+
+
+class WeldTargets:
+    """Boundary/loose vertices near a strip, indexed for fast weld lookups."""
+
+    def __init__(self, original, target=None):
+        self.vertices = [
+            vertex for vertex in original
+            if vertex.is_valid and not vertex.hide
+            and not (vertex.link_faces and not vertex.is_boundary)
+            and (target is None or vertex not in target.verts)]
+        tree = KDTree(len(self.vertices))
+        for index, vertex in enumerate(self.vertices):
+            tree.insert(vertex.co, index)
+        tree.balance()
+        self.tree = tree
+
+    def near(self, co, radius):
+        return [(self.vertices[index], distance)
+                for _, index, distance in self.tree.find_range(co, radius)]
+
+
+def _snap_strip_quad(bm, face, original, snap_distance=None, project=None, target=None,
+                     snapped_points=None, weld_targets=None):
+    corners = list(face.verts)
+    if snap_distance is None and target is None:
+        return face, bm.edges.get((corners[2], corners[3]))
+    a, b = corners[0], corners[1]
+    width = (b.co - a.co).length
+    for corner_idx, base_idx, other_idx in ((3, 0, 2), (2, 1, 3)):
+        corner = corners[corner_idx]
+        base = corners[base_idx]
+        other = corners[other_idx]
+        if corner in original or not corner.is_valid:
+            continue
+        step_length = (corner.co - base.co).length
+        scale = min(step_length, width) if step_length > 1e-8 and width > 1e-8 else max(step_length, width)
+        if snap_distance is not None:
+            # Weld within Merge Radius, but keep the face-reach of the previous
+            # auto-connect so strokes drawn alongside existing topology weld.
+            snap_radius = snap_distance(corner.co)
+            connected_limit = max(snap_radius, max(step_length, width) * 0.75)
+            unconnected_limit = max(snap_radius, scale * 0.45)
+            base_limit = connected_limit
+            pool = ([vertex for vertex, _ in weld_targets.near(
+                corner.co, max(connected_limit, unconnected_limit))]
+                if weld_targets is not None else original)
+        else:
+            connected_limit = unconnected_limit = base_limit = 0.0
+            pool = ()
+        candidates = []
+        for vertex in pool:
+            if not vertex.is_valid or vertex.hide or vertex in corners:
+                continue
+            if target is not None and vertex in target.verts:
+                continue
+            if vertex.link_faces and not vertex.is_boundary:
+                continue
+            dist = (vertex.co - corner.co).length
+            side_edge = bm.edges.get((base, vertex)) if base in original else None
+            if side_edge is not None and not side_edge.hide and len(side_edge.link_faces) <= 1:
+                if (vertex.co - base.co).dot(corner.co - base.co) > 0 and dist <= connected_limit:
+                    candidates.append((0, dist, vertex, vertex.co.copy()))
+            elif dist <= unconnected_limit:
+                candidates.append((1, dist, vertex, vertex.co.copy()))
+        for _, _, candidate, co in sorted(candidates, key=lambda item: item[:2]):
+            old_corner = corner.co.copy()
+            old_other = other.co.copy()
+            span_vec = old_other - old_corner
+            other_trials = [old_other]
+            if other not in original and span_vec.length > 1e-8:
+                span_dir = span_vec.normalized()
+                old_w = span_vec.length
+                new_w = (old_other - co).dot(span_dir)
+                if new_w < old_w:
+                    shifted = old_other + span_dir * (old_w - new_w)
+                    other_trials.insert(0, project(shifted) if project is not None else shifted)
+            corner.co = co
+            proposed = [candidate if v == corner else v for v in corners]
+            welded = False
+            for trial_other in other_trials:
+                other.co = trial_other
+                try:
+                    check_face(bm, proposed, replacing=face)
+                    if _has_face_winding_conflict(bm, proposed, replacing=face):
+                        raise ValueError(WINDING_ERROR)
+                except ValueError:
+                    continue
+                welded = True
+                break
+            if not welded:
+                corner.co = old_corner
+                other.co = old_other
+                continue
+            if snapped_points is not None:
+                snapped_points.append(co.copy())
+            corners[corner_idx] = candidate
+            bmesh.ops.weld_verts(bm, targetmap={corner: candidate})
+            face = next(f for f in candidate.link_faces if set(f.verts) == set(corners))
+            if base not in original and base.is_valid:
+                for edge in candidate.link_edges:
+                    if edge.hide or len(edge.link_faces) > 1:
+                        continue
+                    prev_vert = edge.other_vert(candidate)
+                    if (prev_vert in original and not prev_vert.hide and prev_vert not in corners
+                            and (prev_vert.co - base.co).length <= base_limit):
+                        old_base = base.co.copy()
+                        base.co = prev_vert.co.copy()
+                        try:
+                            for linked in list(base.link_faces):
+                                linked_verts = [prev_vert if v == base else v for v in linked.verts]
+                                check_face(bm, linked_verts, replacing=linked)
+                                if _has_face_winding_conflict(bm, linked_verts, replacing=linked):
+                                    raise ValueError(WINDING_ERROR)
+                        except ValueError:
+                            base.co = old_base
+                            continue
+                        if snapped_points is not None:
+                            snapped_points.append(prev_vert.co.copy())
+                        corners[base_idx] = prev_vert
+                        bmesh.ops.weld_verts(bm, targetmap={base: prev_vert})
+                        face = next(f for f in candidate.link_faces if set(f.verts) == set(corners))
+                        break
+            break
+    return face, bm.edges.get((corners[2], corners[3]))
+
+
+def quad_strip(bm, anchor, points, project=None, target=None, snap_distance=None, snapped_points=None,
+               triangle=False):
     """Extrude a whole stroke, rolling back geometry if any quad is invalid."""
     if not isinstance(anchor, bmesh.types.BMEdge) or anchor.hide or len(anchor.link_faces) > 1:
         raise ValueError("Select a boundary or loose edge to draw a strip")
     original = set(bm.verts)
     original_edges = set(bm.edges)
+    weld_targets = WeldTargets(original, target) if snap_distance is not None else None
     faces = []
     edge = anchor
     try:
-        for point in points:
-            face = extrude_quad(bm, edge, point, project=project, finalize=False)
+        if triangle and len(points) == 1 and not anchor.link_faces:
+            # Starting new topology from a single loose edge: the first face
+            # after that edge is a pending triangle at the cursor, exactly like
+            # a plain Ctrl-click. The next click completes it into a quad.
+            face = extend(bm, anchor, bm.verts.new(project(points[0]) if project else points[0]))
             faces.append(face)
-            corners = list(face.verts)
-            edge = bm.edges.get((corners[2], corners[3]))
-        if target is not None:
+            return faces
+        for point in points:
+            if edge is None or len(edge.link_faces) > 1:
+                break
+            face = extrude_quad(bm, edge, point, project=project, finalize=False)
+            face, edge = _snap_strip_quad(bm, face, original, snap_distance, project, target,
+                                          snapped_points, weld_targets)
+            faces.append(face)
+        if target is not None and edge != target:
             face = bridge(bm, edge, target, finalize=False, repair_winding=False)
             if edge.link_faces:
                 source = next((f for f in edge.link_faces if f != face), None)
@@ -936,6 +1190,8 @@ def quad_strip(bm, anchor, points, project=None, target=None):
             faces.append(face)
             edge = target
     except Exception:
+        if snapped_points is not None:
+            snapped_points.clear()
         for face in faces:
             if face.is_valid:
                 bm.faces.remove(face)
@@ -953,7 +1209,7 @@ def quad_strip(bm, anchor, points, project=None, target=None):
 
 
 def extend(bm, anchor, vertex, quad_only=False):
-    if quad_only and isinstance(anchor, bmesh.types.BMEdge) and not pending(bm):
+    if quad_only and isinstance(anchor, bmesh.types.BMEdge) and not pending(bm, anchor):
         return extrude_quad(bm, anchor, vertex.co, target=vertex)
     # Adding a custom-data layer can invalidate existing wrappers in that domain.
     anchor_verts = tuple(anchor.verts) if isinstance(anchor, bmesh.types.BMEdge) else None
@@ -961,7 +1217,7 @@ def extend(bm, anchor, vertex, quad_only=False):
     edge_layer = bm.edges.layers.int.get(BASE) or bm.edges.layers.int.new(BASE)
     if anchor_verts:
         anchor = bm.edges.get(anchor_verts)
-    state = pending(bm)
+    state = pending(bm, anchor)
     if state:
         face, a, b, c = state
         verts = [a, b, c, vertex]
@@ -996,10 +1252,116 @@ def extend(bm, anchor, vertex, quad_only=False):
     clear_pending(bm, discard=quad_only)
     if isinstance(anchor, bmesh.types.BMVert) and anchor != vertex:
         edge = bm.edges.get((anchor, vertex)) or bm.edges.new((anchor, vertex))
+        # Select the whole edge so the next click builds a face from it
+        # instead of continuing a lone vertex chain.
         select(bm, edge)
         return edge
     select(bm, vertex)
     return vertex
+
+
+def boundary_outward(edge):
+    if edge is None or edge.hide or len(edge.link_faces) != 1:
+        return None
+    face = edge.link_faces[0]
+    if face.hide:
+        return None
+    a, b = edge.verts[0].co, edge.verts[1].co
+    span = b - a
+    if span.length_squared <= 1e-16:
+        return None
+    mid = (a + b) * 0.5
+    inward = face.calc_center_median() - mid
+    perp = inward - span * (inward.dot(span) / span.length_squared)
+    return -perp.normalized() if perp.length > 1e-10 else None
+
+
+def _edge_point_distance(edge, point):
+    a, b = edge.verts[0].co, edge.verts[1].co
+    span = b - a
+    t = max(0.0, min(1.0, (point - a).dot(span) / max(span.length_squared, 1e-16)))
+    return (point - a.lerp(b, t)).length
+
+
+def hover_select_edge(bm, anchor=None, point=None):
+    """When hovering behind or alongside the active boundary edge, switch to the closest boundary edge."""
+    if anchor is None:
+        anchor = active(bm)
+    if (point is None or not isinstance(anchor, bmesh.types.BMEdge)
+            or anchor.hide or len(anchor.link_faces) != 1 or pending(bm)):
+        return anchor
+    outward = boundary_outward(anchor)
+    if outward is None:
+        return anchor
+    a, b = anchor.verts[0].co, anchor.verts[1].co
+    span = b - a
+    length = span.length
+    if length <= 1e-8:
+        return anchor
+    mid = (a + b) * 0.5
+    forward = (point - mid).dot(outward)
+    along = abs((point - mid).dot(span / length))
+    faces = set()
+    queue = [anchor.link_faces[0]]
+    while queue:
+        face = queue.pop()
+        if face in faces or face.hide:
+            continue
+        faces.add(face)
+        for edge in face.edges:
+            if not edge.hide:
+                queue.extend(f for f in edge.link_faces if f not in faces and not f.hide)
+    candidates = {e for f in faces for e in f.edges if e != anchor and not e.hide and len(e.link_faces) == 1}
+    if not candidates:
+        return anchor
+    anchor_dist = _edge_point_distance(anchor, point)
+    if forward >= -length * 0.1:
+        if along <= length * 0.75:
+            return anchor
+        # Allow sliding along a multi-quad border to an adjacent collinear boundary edge.
+        side_candidates = []
+        for edge in candidates:
+            e_outward = boundary_outward(edge)
+            if e_outward is None:
+                continue
+            ea, eb = edge.verts[0].co, edge.verts[1].co
+            e_span = eb - ea
+            e_len = e_span.length
+            if e_len <= 1e-8:
+                continue
+            e_mid = (ea + eb) * 0.5
+            e_forward = (point - e_mid).dot(e_outward)
+            e_along = abs((point - e_mid).dot(e_span / e_len))
+            dist = _edge_point_distance(edge, point)
+            if e_forward >= 0 and e_along <= e_len * 0.6 and dist < anchor_dist * 0.8:
+                side_candidates.append((-dist, edge))
+        if side_candidates:
+            best_edge = max(side_candidates, key=lambda item: item[0])[1]
+            select(bm, best_edge)
+            return best_edge
+        return anchor
+    best_edge = None
+    best_score = None
+    for edge in candidates:
+        e_outward = boundary_outward(edge)
+        if e_outward is None:
+            continue
+        e_mid = (edge.verts[0].co + edge.verts[1].co) * 0.5
+        e_forward = (point - e_mid).dot(e_outward)
+        dist = _edge_point_distance(edge, point)
+        # Use the same improvement margin as lateral switching. Near-equal
+        # candidates should not flip the active edge as the hand drifts.
+        if dist >= anchor_dist * 0.8:
+            continue
+        score = (-dist, e_forward >= 0, edge in anchor.link_faces[0].edges, e_forward,
+                 tuple(sorted(tuple(v.co) for v in edge.verts)))
+        if best_score is None or score > best_score:
+            best_score = score
+            best_edge = edge
+    if best_edge is not None:
+        select(bm, best_edge)
+        return best_edge
+    return anchor
 
 
 def bridge(bm, source, target, quad_only=False, finalize=True, repair_winding=True):
@@ -1030,12 +1392,18 @@ def connect_cut(bm, start, end, discard_pending=False):
     if existing:
         result = existing
     elif start.link_faces and end.link_faces:
-        edges = bmesh.ops.connect_vert_pair(
-            bm, verts=[start, end], faces_exclude=[f for f in bm.faces if f.hide]
-        )['edges']
-        if not edges:
+        try:
+            edges = bmesh.ops.connect_vert_pair(
+                bm, verts=[start, end], faces_exclude=[f for f in bm.faces if f.hide]
+            )['edges']
+        except RuntimeError:
+            edges = []
+        if edges:
+            result = edges
+        elif (not start.link_faces or start.is_boundary) and (not end.link_faces or end.is_boundary):
+            result = bm.edges.new((start, end))
+        else:
             raise ValueError("No face path for this cut; click an intermediate edge")
-        result = edges
     else:
         result = bm.edges.new((start, end))
     clear_pending(bm, discard=discard_pending)
@@ -1077,19 +1445,33 @@ def snap_quad(bm, face, original, snap_distance, snapped_points=None):
     return face
 
 
-def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, project=None, quad_only=False, snap_distance=None, snapped_points=None):
+def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, project=None, quad_only=False, snap_distance=None, snapped_points=None, auto_reselect=True):
     original = set(bm.verts)
-    result = _apply_click(bm, anchor, hit, point, edge_factor, bridge_mode, quad_only)
+    result = _apply_click(bm, anchor, hit, point, edge_factor, bridge_mode, quad_only, auto_reselect)
     if project is not None:
         positions = [(v, project(v.co)) for v in bm.verts if v not in original]
         for vertex, position in positions:
             vertex.co = position
     if quad_only and snap_distance is not None and isinstance(result, bmesh.types.BMFace):
         result = snap_quad(bm, result, original, snap_distance, snapped_points)
+    elif isinstance(anchor, bmesh.types.BMVert) and isinstance(result, bmesh.types.BMEdge) and snap_distance is not None:
+        new_vert = next((v for v in result.verts if v not in original), None)
+        if new_vert is not None:
+            radius = snap_distance(new_vert.co) * 0.25
+            candidates = [((v.co - new_vert.co).length, v) for v in original
+                          if v.is_valid and not v.hide and v != anchor and (v.co - new_vert.co).length <= radius]
+            if candidates:
+                _, target = min(candidates, key=lambda item: item[0])
+                if snapped_points is not None:
+                    snapped_points.append(target.co.copy())
+                bmesh.ops.delete(bm, geom=[new_vert], context='VERTS')
+                result = connect_cut(bm, anchor, target, quad_only)
     return result
 
 
-def _apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, quad_only=False):
+def _apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, quad_only=False, auto_reselect=True):
+    if auto_reselect and hit is None and point is not None and not bridge_mode:
+        anchor = hover_select_edge(bm, anchor, point)
     if isinstance(hit, bmesh.types.BMEdge):
         if bridge_mode or (isinstance(anchor, bmesh.types.BMEdge) and anchor != hit):
             if not isinstance(anchor, bmesh.types.BMEdge):
@@ -1107,11 +1489,11 @@ def _apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False
         return connect_cut(bm, anchor, hit, quad_only)
     if isinstance(hit, bmesh.types.BMVert) and isinstance(anchor, bmesh.types.BMEdge) and hit in anchor.verts:
         clear_pending(bm, discard=quad_only)
-        select(bm, hit)
-        return hit
+        select(bm, anchor)
+        return anchor
     if hit is None and point is None:
         raise ValueError("Cursor is outside the reference surface")
-    if quad_only and isinstance(anchor, bmesh.types.BMEdge) and not pending(bm):
+    if quad_only and isinstance(anchor, bmesh.types.BMEdge) and not pending(bm, anchor):
         return extrude_quad(bm, anchor, hit.co if hit is not None else point, target=hit)
     return extend(bm, anchor, hit if hit is not None else bm.verts.new(point), quad_only)
 
@@ -1130,6 +1512,10 @@ def collapse_edge_midpoint(bm, edge):
     source, target = edge.verts
     target.co = (source.co + target.co) * 0.5
     return merge_vertices(bm, source, target)
+
+
+
+
 
 
 def edge_triangle_plan(bm, edge, factor, target):
