@@ -41,7 +41,7 @@ PowerShell gotcha: piping Blender output through `Select-String`/`Select-Object`
 - `tests/blender_smoke.py` runs the whole `TopologyTests` class at import and `sys.exit(1)`s on failure; there is no per-test runner and pytest would execute the runner during collection.
 - Tests pass `SimpleNamespace` as the operator instance and call methods unbound (`RP_OT_click.modal(stroke, context, event)`). `self` is not a real operator: call sibling helpers as `RP_OT_click.helper(self, ...)` or module-level functions — `self.helper()` breaks the suite.
 - Modal drags store element **indices and mesh counts**, not `BMVert`/`BMEdge` wrappers: Blender can rebuild the edit BMesh between mouse events (tests cover this). Re-fetch elements and verify counts every event.
-- Built-in symmetry has been removed. Keep Draw, vertex/edge movement, and Brush/Relax local to the active mesh; use Blender's Mirror modifier for symmetry. Starting a move commits pending triangles without deleting them.
+- Symmetry is optional and defaults off. Mirror across every enabled local zero plane. Snap to Center also works with symmetry off. Topology previews validate mirrored edits and center snapping on a copy, and modal moves retain partner indices and coordinates across events. Keep the last committed edit side for each axis in undoable mesh data, even with symmetry off. Resymmetrize validates the source region across the enabled axes before applying in one undo step. Starting a move commits pending triangles without deleting them.
 - Alt cuts use `RP_OT_alt_cut`: Alt-click is knife insertion/connection; Alt-drag (six pixels) over an edge is a loop cut. Alt-hover must not change selection. Knife previews use the same `topology.apply_click()` call as commit; loop previews run `topology.loop_cut()` on a copy. Store only element indices/counts across events and lock the loop source when acquired, recalculating its cut factor from every mousemove and release position. Ctrl-drag on interior/unselected edges cancels; Alt-click deletion has been removed.
 - Previews must run the same `topology.*` call on `bm.copy()` (see `preview`, `strip_preview`, `grid_preview`) so preview and commit cannot diverge.
 - After mutating the edit mesh call `sync(obj)`: `destructive=False` during live drag previews, default `destructive=True` on release/commit. `sync` also invalidates `_visibility_cache` / `_grid_preview_cache`.
@@ -65,3 +65,6 @@ PowerShell gotcha: piping Blender output through `Select-String`/`Select-Object`
 - `python` must be 3.11+ (`tomllib`).
 - `topopot_retopo_tool/assets/retopo_icon.dat` is required by `build.py` but is gitignored and untracked on disk — do not delete or clean it.
 - `__pycache__/*.pyc` files are tracked in git even though they are generated; do not commit changes to them.
+
+
+- Fill Hole defaults to Quads Only; Ctrl enables Quad/Tri. Wheel-based side-count adjustment was removed; keep wheel events available for viewport zoom. Quad/Tri uses area-aware layouts and `_equalize_fill_areas()` to adjust only new interior points while preserving the rim, reference snapping, and valid faces.

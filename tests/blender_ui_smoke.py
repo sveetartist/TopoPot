@@ -70,9 +70,9 @@ def geometry():
     bm.verts.ensure_lookup_table()
     return bm
 
-def send(kind, value, point, ctrl=False):
+def send(kind, value, point, ctrl=False, alt=False):
     bpy.context.window.event_simulate(type=kind, value=value,
-        x=round(region.x + point.x), y=round(region.y + point.y), ctrl=ctrl)
+        x=round(region.x + point.x), y=round(region.y + point.y), ctrl=ctrl, alt=alt)
 
 step = 0
 def tick():
@@ -187,12 +187,14 @@ def tick():
         elif step == 29:
             send('LEFTMOUSE', 'RELEASE', edge_start)
         elif step == 30:
-            assert len(geometry().verts) == 15, 'Edge click did not collapse endpoints'
-            assert any((v.co - edge_midpoint).length < 1e-5 for v in geometry().verts), 'Edge did not collapse to midpoint'
+            bm = geometry()
+            assert len(bm.verts) == 16 and len(bm.faces) == 8, 'Edge click changed topology'
+            assert all((v.co - co).length < 1e-5 for v, co in zip(bm.verts, edge_originals)), 'Edge click moved vertices'
+            assert addon.topology.active(bm) == bm.edges.get((bm.verts[1], bm.verts[2])), 'Edge click did not select edge'
             with bpy.context.temp_override(area=area, region=region):
                 bpy.ops.ed.undo()
         elif step == 31:
-            assert len(geometry().verts) == 16, 'Edge collapse undo failed'
+            assert len(geometry().verts) == 16, 'Edge selection undo changed topology'
             send('MOUSEMOVE', 'NOTHING', edge_start)
         elif step == 32:
             bm = geometry()
@@ -212,13 +214,134 @@ def tick():
             assert all(len(e.link_faces) <= 2 for e in bm.edges)
             with bpy.context.temp_override(area=area, region=region):
                 bpy.ops.ed.undo()
+        elif step == 35:
+            global edge_merge_start, edge_merge_end
+            bm = geometry()
+            assert len(bm.verts) == 16 and len(bm.faces) == 8
+            bpy.context.scene.retopo_tool.fill_merge = True
+            edge_merge_start = view3d_utils.location_3d_to_region_2d(
+                region, view, (bm.verts[1].co + bm.verts[2].co) * 0.5)
+            edge_merge_end = view3d_utils.location_3d_to_region_2d(
+                region, view, (bm.verts[9].co + bm.verts[10].co) * 0.5)
+            send('MOUSEMOVE', 'NOTHING', edge_merge_start)
+        elif step == 36:
+            send('LEFTMOUSE', 'PRESS', edge_merge_start)
+        elif step == 37:
+            send('MOUSEMOVE', 'NOTHING', edge_merge_end)
+        elif step == 38:
+            send('LEFTMOUSE', 'RELEASE', edge_merge_end)
+        elif step == 39:
+            bm = geometry()
+            assert len(bm.verts) == 14 and len(bm.faces) == 7, 'Whole edge merge failed'
+            assert all(len(e.link_faces) <= 2 for e in bm.edges)
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo()
+        elif step == 40:
+            assert len(geometry().verts) == 16 and len(geometry().faces) == 8, 'Edge merge undo failed'
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.redo()
+        elif step == 41:
+            assert len(geometry().verts) == 14 and len(geometry().faces) == 7, 'Edge merge redo failed'
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo()
+        elif step == 42:
+            global alt_start, alt_end, knife_start, knife_end
+            assert len(geometry().verts) == 16 and len(geometry().faces) == 8
+            alt_start = view3d_utils.location_3d_to_region_2d(region, view, Vector((1.5, 0, 0)))
+            alt_end = view3d_utils.location_3d_to_region_2d(region, view, Vector((1.65, 0, 0)))
+            send('MOUSEMOVE', 'NOTHING', alt_start, alt=True)
+        elif step == 43:
+            send('LEFTMOUSE', 'PRESS', alt_start, alt=True)
+        elif step == 44:
+            send('MOUSEMOVE', 'NOTHING', alt_end + Vector((0, 12)), alt=True)
+        elif step == 45:
+            assert addon._loop_preview is not None, 'Fill Hole Alt-drag has no loop preview'
+            assert len(geometry().verts) == 16, 'Alt-drag edited mesh before release'
+            send('LEFTMOUSE', 'RELEASE', alt_end, alt=True)
+        elif step == 46:
+            assert len(geometry().verts) == 24 and len(geometry().faces) == 16, 'Fill Hole loop cut failed'
+            assert bpy.context.scene.retopo_tool.mode == 'GRID'
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo()
+        elif step == 47:
+            assert len(geometry().verts) == 16 and len(geometry().faces) == 8, 'Loop undo failed'
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.redo()
+        elif step == 48:
+            assert len(geometry().verts) == 24 and len(geometry().faces) == 16, 'Loop redo failed'
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo()
+        elif step == 49:
+            bm = geometry()
+            addon.topology.select(bm, None)
+            addon.sync(bpy.data.objects[name])
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo_push(message='Knife baseline')
+            bm = geometry()
+            knife_start = view3d_utils.location_3d_to_region_2d(region, view, (bm.verts[1].co + bm.verts[2].co) * 0.5)
+            knife_end = view3d_utils.location_3d_to_region_2d(region, view, (bm.verts[9].co + bm.verts[10].co) * 0.5)
+            send('MOUSEMOVE', 'NOTHING', knife_start, alt=True)
+        elif step == 50:
+            send('LEFTMOUSE', 'PRESS', knife_start, alt=True)
+        elif step == 51:
+            send('LEFTMOUSE', 'RELEASE', knife_start, alt=True)
+        elif step == 52:
+            assert len(geometry().verts) == 17 and len(geometry().faces) == 8, 'Alt-click did not insert a knife point'
+            send('MOUSEMOVE', 'NOTHING', knife_end, alt=True)
+        elif step == 53:
+            send('LEFTMOUSE', 'PRESS', knife_end, alt=True)
+        elif step == 54:
+            send('LEFTMOUSE', 'RELEASE', knife_end, alt=True)
+        elif step == 55:
+            assert len(geometry().verts) == 18 and len(geometry().faces) == 9, 'Alt-click did not connect across face'
+            assert bpy.context.scene.retopo_tool.mode == 'GRID'
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo()
+        elif step == 56:
+            assert len(geometry().verts) == 17 and len(geometry().faces) == 8, 'Knife undo failed'
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.redo()
+        elif step == 57:
+            assert len(geometry().verts) == 18 and len(geometry().faces) == 9, 'Knife redo failed'
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo()
+        elif step == 58:
+            with bpy.context.temp_override(area=area, region=region):
+                bpy.ops.ed.undo()
+        elif step == 59:
+            assert len(geometry().verts) == 16 and len(geometry().faces) == 8, 'Knife point undo failed'
+            send('MOUSEMOVE', 'NOTHING', alt_start, alt=True)
+        elif step == 60:
+            send('LEFTMOUSE', 'PRESS', alt_start, alt=True)
+        elif step == 61:
+            send('MOUSEMOVE', 'NOTHING', alt_end + Vector((0, 12)), alt=True)
+        elif step == 62:
+            send('RIGHTMOUSE', 'PRESS', alt_end, alt=True)
+        elif step == 63:
+            send('RIGHTMOUSE', 'RELEASE', alt_end, alt=True)
+        elif step == 64:
+            assert len(geometry().verts) == 16 and len(geometry().faces) == 8, 'Cancel changed geometry'
+            assert bpy.context.scene.retopo_tool.mode == 'GRID', 'Canceling Alt left Fill Hole'
+            assert addon._loop_preview is None and addon._knife_preview is None
+            send('MOUSEMOVE', 'NOTHING', center)
+        elif step == 65:
+            assert addon._grid_preview_cache and addon._grid_preview_cache.get('visible'), 'No persistent fill preview'
+            bpy.ops.screen.screenshot(filepath=str(report.with_suffix('.png')))
+            addon._mouse_region = None
+            bpy.context.window_manager.retopo_tool_mouse = (-100, -100)
+            area.tag_redraw()
+        elif step == 66:
+            assert addon._grid_preview_cache and addon._grid_preview_cache.get('visible'), 'Fill preview disappeared without a mouse region'
+            bpy.ops.screen.screenshot(filepath=str(report.with_name('blender_ui_fill_no_hover.png')))
         else:
             assert len(geometry().verts) == 16 and len(geometry().faces) == 8, 'Ctrl-click undo failed'
             assert bpy.context.scene.retopo_tool.mode == 'GRID'
             report.write_text(json.dumps({'status': 'passed', 'version': bpy.app.version_string,
                 'checks': ['real mouse drag', 'undo', 'redo', 'cancel', 'merge on release',
                            'merge with off-center grip', 'merge undo/redo', 'fill after reshape',
-                           'edge drag', 'edge collapse', 'Ctrl-click edge triangle', 'edge undo', 'Draw label']}))
+                           'edge drag', 'edge click selects without merging', 'Ctrl-click edge triangle', 'edge undo', 'Draw label', 'neighboring edge merge', 'edge merge undo/redo',
+                           'Fill Hole Alt loop preview', 'loop undo/redo', 'Alt knife insert/connect', 'knife undo/redo', 'Alt cancel keeps Fill Hole',
+                           'persistent fill preview without mouse region']}))
             bpy.ops.wm.quit_blender()
             return None
         step += 1

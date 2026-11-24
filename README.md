@@ -28,11 +28,23 @@ GPL-3.0-or-later (GNU General Public License version 3 or any later version).
 
 ## Use
 
+The TopoPot sidebar groups controls in collapsible sections.
+
+- **Tools** activates TopoPot and switches between Draw, Brush, Box Select, and Fill Hole.
+- **Tool Options** shows settings for the current tool, plus snapping and the pick and merge radii.
+- **Symmetry** contains the axis toggles, Snap to Center, and Resymmetrize.
+- **Reference** contains the reference collection, surface offset, and Move Selection to Reference.
+- **Display** contains Retopology View, View Offset, and the topology color preset.
+
+In **Display**, select the Custom preset to edit the Draw and face Overlay swatches.
+The colors update the viewport immediately and share the add-on Preferences settings.
+Adjust overlay opacity in the add-on Preferences.
+
 1. Select the mesh you want to edit in Object Mode. Open the 3D View sidebar
-   with N, choose TopoPot, and press Activate Draw Tool. The panel header shows
+   with N, choose TopoPot, and press Activate Draw Tool under **Tools**. The panel header shows
    **TopoPot - Retopology Tool** and the installed version. The selected mesh
    enters Edit Mode. With no mesh selected, activation creates an empty mesh.
-   Set Reference to a collection when you want projection onto its meshes.
+   Under **Reference**, select a collection to project onto its meshes.
    In Object Mode, select reference meshes and click Move Selection to Reference
    to move them into a reference collection and assign it to Reference.
 2. Ctrl-click empty space (or the Reference surface) to place the first vertex.
@@ -53,11 +65,9 @@ GPL-3.0-or-later (GNU General Public License version 3 or any later version).
    selected vertices joined by an edge also count as the starting edge. Edges
    with a shared endpoint form a triangle; separate edges form a quad.
   Finish or commit a pending triangle before bridging.
-6. Ctrl-click the selected edge itself to insert a vertex at the clicked
-   position and select it. With that vertex selected, Ctrl-click another vertex
-   or edge to cut through the topology from it. Moving with Ctrl held keeps the
-   inserted vertex selected so the cut can continue; press Ctrl again to switch
-   a single vertex to its closest full edge for drawing faces.
+6. Ctrl-clicking the selected edge keeps it selected without inserting a vertex.
+   With Auto Reselect enabled, Ctrl switches single or multiple selected vertices
+   to a nearby boundary or loose edge for drawing. Use Alt for knife cuts.
 
 ## Drawing Face Strips
 
@@ -92,7 +102,13 @@ With Snapping enabled, strips automatically snap and connect to nearby boundary
 vertices along the sides as well as at the end. A corner welds when it is within
 **Merge Radius** (the same screen distance used when dragging vertices) or within
 the strip's own reach of three quarters of a face width, whichever is farther, so
-strokes drawn alongside existing topology join it without exact aiming. Corners
+strokes drawn alongside existing topology join it without exact aiming. When a
+side corner welds, the free corner follows that row's displacement to preserve
+the strip width, with reference snapping and face validity checks. Along an
+attached boundary with much longer edges, the strip uses the neighboring row spacing
+instead of inserting extra small quads based on the starting edge's width. A
+single tip face grows until it reaches the next row; dragging away resumes free
+strip spacing. Corners
 farther than both limits stay separate. Hover another
 visible loose or boundary edge within Merge Radius to connect: the preview and
 destination edge turn green, and the header shows "Connect strip to edge". Release
@@ -116,16 +132,20 @@ connected quad strip. Ctrl-dragging other edges cancels without cutting.
 ## Fill Hole
 
 Open the Shift-Alt-Q pie menu and choose Fill Hole, which replaces the old
-Preserve Borders pie entry. Point inside a visible hole to preview the filled
-area in cyan; no selection is required. The viewport header shows the fill mode
-and the quad/triangle counts. Left-click inside the hole to apply the preview in one undo step.
+Preserve Borders pie entry. All visible holes show their possible fill in cyan
+while Fill Hole is active, including when the pointer is away from a hole or
+outside the viewport; no selection is required. Previews refresh after viewport
+navigation or a rim drag finishes. Fill Hole caches the Quads Only and Quad/Tri
+layouts for the current mesh. The viewport header shows the hovered hole's fill
+mode and the quad/triangle counts. Left-click inside the hole to apply the preview
+in one undo step.
 Fill Hole stays active for the next hole. Choose Fill Hole again in the pie, choose another
 mode, or press Esc/right-click to return to Draw.
 
-Drag a visible vertex while Fill Hole is active to reshape the rim toward a
-rectangle before filling. Release to keep the move in one undo step; Esc or
+Drag a visible vertex while Fill Hole is active to reshape the rim before filling. Release to keep the move in one undo step; Esc or
 right-click during the drag restores its original position and keeps Fill Hole
-active. A click or small mouse jitter on a vertex leaves the hole unfilled.
+active. A click or small mouse jitter on a vertex selects it without moving,
+merging, or filling the hole.
 Dragging follows Reference with Snapping enabled; without Reference it moves
 at the vertex's view depth. **Merge on Drag** is enabled by default in the Fill
 Hole sidebar and tool settings. Drag the cursor onto another vertex within
@@ -138,38 +158,42 @@ The fill preview and side counts refresh after mesh changes.
 Drag the middle of an edge to move both endpoints together. While **Merge on
 Drag** is enabled, either endpoint within **Merge Radius** of another visible
 vertex snaps onto it, and release welds the snapping endpoints in one undo step.
+Drag the edge's center onto a neighboring edge to snap both ends together, even
+if the edges have different lengths. Release to merge into the target edge.
+Neighbors share a corner, a face, or an immediate connecting edge; disconnected
+edges are excluded. Shared corners and target positions stay fixed. The preview
+checks the actual weld and rejects non-manifold results.
 Release away from merge targets keeps the move. Esc/right-click restores both
-endpoints without merging. Click an edge without dragging
-to collapse its endpoints into one vertex at the midpoint. Ctrl-click an edge
+endpoints without merging. Click an edge without dragging to select it;
+small mouse jitter does not collapse, merge, or move its endpoints. Ctrl-click an edge
 to insert a vertex at the clicked position and connect it to the closest visible
 vertex that can form a triangle. The connection splits a neighboring face or
 adds a triangle into the hole. Each gesture is one undo step and keeps Fill Hole
 active. Clicking near an endpoint picks that vertex; use the middle of the edge
 for edge gestures.
 
-Quads Only is the default and requires an even number of rim vertices, at least
-four. Hold Ctrl to temporarily switch to Quad/Tri; releasing Ctrl immediately
-restores Quads Only, including when the mouse is stationary. Hold Ctrl while
-clicking to apply the mixed preview. This is independent of Draw's Quad Mode.
-In Quads Only, numbers beside the rim show each side's vertex count, including
-both corner vertices. The four corners are detected from the sharpest rim turns.
-Counts remain visible on invalid fills so you can subdivide or dissolve rim
-vertices to match opposite sides, then hover the hole again to fill it with quads.
-If the first grid folds, Fill Hole tries alternative corners and simpler
-interpolation, then a valid all-quad partition for irregular holes. If those
-cannot form an all-quad layout, the header suggests holding Ctrl for Quad/Tri.
+Alt works just like Draw while Fill Hole is active: Alt-click inserts or connects
+knife points, and Alt-drag over an edge slides a loop cut. Cut previews appear
+over the persistent fill previews. Release to apply in one undo step; Esc/right-click
+cancels the cut and keeps Fill Hole active. Alt-hover leaves selection unchanged.
 
-Quad/Tri builds square interior cells sized from the typical rim edge length.
-A transition band of quads and triangles connects the grid to every rim edge,
-including when opposite sides have unequal counts or the total count is odd.
-Regular grids with near-square cells are reused directly. Concave notches stay
-outside the fill; narrow areas that cannot fit square cells use a boundary-based
-quad/triangle layout. Triangles handle the boundary transitions instead of
-stretching long faces across the hole. Existing rim vertices stay in place.
-Reference snapping can deform the square cells to follow a curved surface.
-Boundary connections favor nearby grid vertices and straight grid rows, with a
-horizontal preference in the grid's own orientation when distances are similar.
-Long diagonal fans are adjusted before triangles are paired into quads.
+Quads Only is the default. Four enlarged white labels with black outlines show
+side vertex counts, including the
+corner vertices. White markers with dark outlines mark the four corners that separate
+the labeled sides, including when a fill is invalid. These are visual guides, not
+draggable handles. Opposite sides should have matching counts for a regular grid.
+The side labels and corner markers hide while Ctrl enables Quad/Tri.
+Click inside the hole to fill. Quads Only needs an even number of rim vertices.
+Hold Ctrl for Quad/Tri when a strict grid is not suitable. Quad/Tri prioritizes
+square quads with equal edges and right angles, together with well-shaped
+triangles targeting the same area as the quads. Its interior adjustment balances
+shape and area together; good interior squares stay within a 1.25 edge-length
+ratio and roughly 75–105 degree corners. The existing rim
+and surrounding topology stay fixed. Boundary spacing and hole shape limit how
+equal the areas can become; fold and sliver checks remain active. New points
+continue to follow Reference when Snapping is enabled.
+
+Wheel-based side recalculation has been removed; scrolling zooms normally.
 
 The fill reuses the hole's existing rim vertices and follows the surrounding
 topology. With Snapping enabled and Reference set, new interior vertices project
@@ -198,16 +222,19 @@ centered at the cursor and selected for the next extrusion. Clicking an existing
 vertex snaps one new corner to it; clicking another boundary edge bridges to it.
 New corners also snap automatically to existing vertices within four times Merge Radius.
 
-TopoPot edits the active retopology mesh without built-in symmetry. For a
-symmetrical result, use Blender's Mirror modifier on a separate retopology mesh.
-The reference mesh stays separate from the mesh you edit.
-
 In Brush mode, left-drag moves visible vertices inside the brush with a soft
 falloff. Hold Shift while dragging to relax geometry. Both operations snap to
 Reference when set. Press F and move the mouse horizontally to adjust the brush
 radius; left-click confirms and Esc/right-click cancels the size change.
+Press Shift+F and move right to increase strength or left to decrease it;
+left-click confirms and Esc/right-click restores the previous strength. Strength
+affects both Move and Shift-Relax, from 0% to 100%, and is also available in the
+Brush sidebar and tool settings. The default 100% preserves the original behavior.
+The outer cursor circle shows radius; the inner circle shows strength in the same
+brush color at lower opacity. It grows with strength and updates live during
+Shift+F adjustment. Both circles hide while orbiting, panning, or zooming.
 Esc/right-click during a brush stroke restores the original vertex positions.
-Brush strokes support normal undo and do not merge vertices.
+Brush strokes support normal undo.
 
 - Hold Alt to preview a knife point or a cut line from the selected vertex.
   Alt-left-click an edge to insert a point, or click an existing vertex to reuse
@@ -227,27 +254,21 @@ Brush strokes support normal undo and do not merge vertices.
   Release confirms the loop at the current mouse position.
   Esc or right-click before release cancels without changing the mesh. The cut stops at
   boundaries, non-quad faces, hidden geometry, and non-manifold edges.
-- A Ctrl-click without dragging subdivides the clicked edge on release unless
-  a different edge is selected, in which case it bridges. Ctrl-drag from the
-  selected boundary or loose edge draws a face strip; dragging an interior or
-  unselected edge cancels without editing.
-
-- Ctrl-click an edge to insert a vertex at the cursor position. Adjacent faces
-  retain their surface and gain the inserted corner.
-- Ctrl-click another edge to split it and connect from the previous cut point.
-- Select a vertex, then Ctrl-click another vertex or edge to cut between them.
-- Cuts split existing faces, including a path across multiple faces where
-  Blender can resolve it. The last point stays selected for continued cutting.
-- Click empty space without Ctrl to clear the cut starting point. Ctrl-click
-  an edge after that to subdivide it without connecting to an earlier point.
-
-Hold Ctrl for the insertion-point, cut-line, or bridge preview. Ctrl-Shift also
-supports bridging. Connections that cannot form a face path are rejected before editing
-the mesh; use intermediate edge clicks to define a path in complex topology.
+- Ctrl-clicking the selected edge keeps it selected; clicking another boundary
+  edge bridges from the active edge. Ctrl-drag from a selected boundary or loose
+  edge draws a face strip. Ctrl never subdivides edges or cuts existing faces.
+- Alt-click an edge to insert a knife point, or another vertex/edge to continue
+  a cut from the previous point. Cuts can split existing faces across a path.
+  Use intermediate Alt-clicks to define a path in complex topology.
+- Alt-hover shows the knife preview; Alt-drag over an edge cuts a quad loop.
+  Ctrl previews drawing and bridging. Ctrl-Shift also supports bridging.
 
 Left-click selects a vertex or edge; drag a vertex to move it on the surface.
 Left-drag the middle of an edge to move both endpoints together. Endpoints snap
 to Reference when set; without Reference the edge translates in the view plane.
+With Snapping enabled, drag its center onto a neighboring edge within Merge Radius
+to snap both endpoints and weld on release. This uses the same neighboring-edge
+rules as Fill Hole, keeps the target in place, and supports undo and cancellation.
 Each endpoint can also snap onto another visible vertex within Merge Radius while
 dragging, highlighted in amber. Release to weld the snapping endpoints and move
 the rest in one undo step. Esc/right-click restores both endpoints without
@@ -268,7 +289,9 @@ Alt-click makes knife cuts and Alt-drag cuts quad loops; neither deletes geometr
 Blender's native X/Delete commands for deletion. Hidden or back-facing geometry
 is ignored. Esc/right-click during dragging restores the
 vertex position. Ctrl-Z uses
-Blender's normal undo history. Middle-mouse navigation and wheel zoom remain
+Blender's normal undo history. After undo or redo, TopoPot refreshes edit-mesh
+picking and reuses cached reference surfaces when their evaluated geometry and
+transforms match. Middle-mouse navigation and wheel zoom remain
 available. Deactivate returns to box selection.
 
 Reference projects onto the closest evaluated mesh surface in the selected
@@ -292,6 +315,33 @@ viewport. It is enabled by default when the add-on is enabled and when activatin
 the tool or switching its mode; you can turn it off in the sidebar.
 View Offset is Blender's overlay offset, independent of the geometry
 projection Offset. Existing object display settings are preserved on activation.
+
+## Symmetry, Snap to Center, and Resymmetrize
+
+Enable **Symmetry** in the TopoPot sidebar or tool settings. Toggle **X**, **Y**,
+and **Z** independently to mirror across one or more mesh-local zero planes.
+With all three enabled, an edit away from the planes mirrors into all eight
+octants. Symmetry defaults to off and X is the default axis.
+Draw, strips, cuts, Fill Hole, vertex and edge movement, and Brush Move/Relax
+edit the actual mesh. Center vertices stay on their respective planes. When
+snapping to a reference, TopoPot projects the edited region and reflects the
+result across the enabled planes.
+Mirrored previews use a darker tint wherever they pass behind visible geometry
+or the reference surface.
+
+Enable **Snap to Center** to place new and moved vertices exactly on the
+enabled planes when they come within **Center Distance**, measured in mesh-local
+units. It also works with Symmetry off. Mirrored vertices that meet on a plane
+or at a plane intersection weld on release.
+
+**Resymmetrize** rebuilds across every enabled plane in one undo step. It keeps
+the region shared by the last edited side on each enabled axis and mirrors
+that region into the others. TopoPot records edit sides for each mesh even
+with Symmetry off. Undo and redo restore the geometry and the recorded sides
+together. If a source is ambiguous or the recorded sides have no shared
+geometry, choose **Negative Side** or **Positive Side** for the affected axis
+in the source dialog. Resymmetrize also creates center seams through faces
+that span its planes.
 
 ## Scope
 
@@ -329,8 +379,9 @@ menu entry, mode switching, applying the fill to a real Edit Mode mesh, Quads On
 by default, Ctrl press/release preview switching, concave and odd-sided holes,
 quad dominance, sliver rejection, non-greedy triangle pairing, and side vertex
 counts on unequal rims and invalid fills.
-Interior-grid tests cover square cell sizes, rotated and scaled unequal rims,
-complete rim connections, concave notches, and multiple interior grid patches.
+Interior-grid tests cover reduced face-area variance, valid quad shapes, rotated
+and scaled unequal rims, complete rim connections, concave notches, and multiple
+interior grid patches. Preview/commit comparisons include area balancing.
 Connection tests cover distant fan replacement, horizontal preference, rotated
 grid rows, and local rim-to-grid distances.
 Grid recovery tests cover alternative layouts, concave all-quad partitions,
@@ -344,7 +395,7 @@ releasing away from a previously highlighted target.
 Vertex start tests cover selecting the whole first edge, building the next face
 from that edge instead of chaining vertices, anchoring the closest border edge
 on Ctrl press while ignoring interior edges, keeping a pending anchor, and
-keeping a split vertex selected for a following Ctrl-click cut.
+reselecting single or multiple selected vertices to an edge without Ctrl cutting.
 Performance/cache tests cover screen-index invalidation after mesh updates,
 cached hole-boundary projection, brush visibility-surface reuse, and preventing
 both dragged edge endpoints from merging into the same target.
@@ -357,11 +408,11 @@ hover without reselection, locked targets across BMesh rebuilds, preview/commit
 agreement, Reference projection, cancellation, and changed topology.
 Ctrl-dragging an interior edge is checked to leave the mesh untouched.
 Edge tests cover moving and canceling both endpoints, endpoint merging within
-Merge Radius, midpoint collapse, Ctrl-click triangle creation, face area
+Merge Radius, click selection without merging, Ctrl-click triangle creation, face area
 preservation, and collinear rejection.
 For the real event and undo regression, run a separate Blender instance with
 `blender --factory-startup --enable-event-simulate --python tests/blender_ui_smoke.py`.
-It checks dragging, merging with an off-center grip, edge dragging and collapse,
+It checks dragging, merging with an off-center grip, edge dragging and selection,
 Ctrl-click triangle creation, undo/redo, cancellation, and filling after reshaping, writes
 its result to `zips/blender_ui_<major>_<minor>.json`, then exits.
 For Draw clicks, stable strip dragging, local movement, and undo/redo, run

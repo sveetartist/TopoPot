@@ -44,7 +44,8 @@ view.view_distance = 10
 view.view_perspective = 'ORTHO'
 settings = bpy.context.scene.retopo_tool
 settings.snapping = False
-assert not any(key.startswith('symmetry') for key in settings.bl_rna.properties.keys())
+assert not settings.x_symmetry
+assert tuple(settings.symmetry_axes) == (True, False, False) and not settings.snap_to_center
 assert addon.RP_PT_panel.bl_label == f"TopoPot - Retopology Tool {addon.ADDON_VERSION}"
 # Old scenes can retain raw values from removed RNA properties. They must have
 # no effect on ordinary Draw or Brush behavior.
@@ -56,11 +57,11 @@ def geometry():
     return bmesh.from_edit_mesh(bpy.data.objects[name].data)
 
 
-def send(kind, value, co, ctrl=True, alt=False):
+def send(kind, value, co, ctrl=True, alt=False, shift=False):
     point = view3d_utils.location_3d_to_region_2d(region, view, Vector((*co, 0)))
     assert point is not None
     bpy.context.window.event_simulate(type=kind, value=value,
-        x=round(region.x + point.x), y=round(region.y + point.y), ctrl=ctrl, alt=alt)
+        x=round(region.x + point.x), y=round(region.y + point.y), ctrl=ctrl, alt=alt, shift=shift)
 
 
 def undo(redo=False):
@@ -352,6 +353,214 @@ def scenario():
     send('LEFT_CTRL', 'RELEASE', (1, 1.8), ctrl=False)
     yield
 
+    original = connectivity()
+    for selected_count in (1, 3):
+        bm = geometry()
+        addon.topology.select(bm, None)
+        selected = list(bm.verts)[:selected_count]
+        for vertex in selected:
+            vertex.select_set(True)
+        bm.select_history.add(selected[-1])
+        addon.sync(bpy.data.objects[name])
+        send('LEFT_CTRL', 'PRESS', (1, 0))
+        yield
+        active = addon.topology.active(geometry())
+        assert isinstance(active, bmesh.types.BMEdge), 'Ctrl did not reselect vertices to an edge'
+        send('LEFTMOUSE', 'PRESS', (1, 0))
+        yield
+        send('LEFTMOUSE', 'RELEASE', (1, 0))
+        yield
+        send('LEFT_CTRL', 'RELEASE', (1, 0), ctrl=False)
+        yield
+        assert connectivity() == original, 'Ctrl-click inserted a cut instead of keeping the edge'
+
+    with bpy.context.temp_override(area=area, region=region):
+        bpy.ops.mesh.retopo_tool_mode(mode='BRUSH')
+    settings = bpy.context.scene.retopo_tool
+    settings.brush_strength = 0.5
+    radius = settings.brush_radius
+    send('F', 'PRESS', (0, 1), ctrl=False, shift=True)
+    yield
+    send('F', 'RELEASE', (0, 1), ctrl=False, shift=True)
+    yield
+    send('MOUSEMOVE', 'NOTHING', (1, 1), ctrl=False)
+    yield
+    assert settings.brush_strength > 0.5, 'Shift-F did not increase strength'
+    assert settings.brush_radius == radius, 'Shift-F changed radius'
+    send('LEFTMOUSE', 'PRESS', (1, 1), ctrl=False)
+    yield
+    send('LEFTMOUSE', 'RELEASE', (1, 1), ctrl=False)
+    yield
+    confirmed = settings.brush_strength
+    send('F', 'PRESS', (1, 1), ctrl=False, shift=True)
+    yield
+    send('F', 'RELEASE', (1, 1), ctrl=False, shift=True)
+    yield
+    send('MOUSEMOVE', 'NOTHING', (0, 1), ctrl=False)
+    yield
+    assert settings.brush_strength < confirmed, 'Shift-F did not decrease strength'
+    send('ESC', 'PRESS', (0, 1), ctrl=False)
+    yield
+    assert abs(settings.brush_strength - confirmed) < 1e-5, 'Strength cancel lost original value'
+    send('F', 'PRESS', (0, 1), ctrl=False)
+    yield
+    send('F', 'RELEASE', (0, 1), ctrl=False)
+    yield
+    send('MOUSEMOVE', 'NOTHING', (1, 1), ctrl=False)
+    yield
+    assert settings.brush_radius > radius, 'F no longer adjusts radius'
+    assert abs(settings.brush_strength - confirmed) < 1e-5, 'F changed strength'
+    send('ESC', 'PRESS', (1, 1), ctrl=False)
+    yield
+    assert settings.brush_radius == radius, 'Radius cancel failed'
+    assert connectivity() == original, 'Brush adjustment changed mesh'
+    send('MOUSEMOVE', 'NOTHING', (1, 1), ctrl=False)
+    yield
+    bpy.ops.screen.screenshot(filepath=str(report.with_name('blender_brush_strength_cursor.png')))
+
+    with bpy.context.temp_override(area=area, region=region):
+        bpy.ops.mesh.retopo_tool_mode(mode='RETOPO')
+        settings.x_symmetry = True
+        settings.auto_reselect = False
+        bm = geometry()
+        bm.clear()
+        left = [bm.verts.new((x, 0, 0)) for x in (-2, -1)]
+        right = [bm.verts.new((x, 0, 0)) for x in (1, 2)]
+        bm.edges.new(left)
+        addon.topology.select(bm, bm.edges.new(right))
+        addon.sync(bpy.context.edit_object)
+        bpy.ops.ed.undo_push(message='X symmetry baseline')
+    yield
+    for co in ((2, 1), (1, 1)):
+        send('MOUSEMOVE', 'NOTHING', co)
+        yield
+        send('LEFTMOUSE', 'PRESS', co)
+        yield
+        send('LEFTMOUSE', 'RELEASE', co)
+        yield
+    assert [len(face.verts) for face in geometry().faces] == [4, 4], 'Draw did not create mirrored quads'
+    assert addon.topology.last_edit_side(geometry()) == 1, 'Draw did not record the right side'
+
+    def height(x):
+        return next(v.co.y for v in geometry().verts if abs(v.co.x - x) < 0.08 and v.co.y > 0.5)
+
+    start = height(2)
+    send('LEFTMOUSE', 'PRESS', (2, 1), ctrl=False)
+    yield
+    send('MOUSEMOVE', 'NOTHING', (2, 1.6), ctrl=False)
+    yield
+    assert height(2) > 1.5 and abs(height(2) - height(-2)) < 1e-5, 'Drag did not mirror live'
+    send('ESC', 'PRESS', (2, 1.6), ctrl=False)
+    yield
+    assert all(abs(height(x) - start) < 1e-5 for x in (-2, 2)), 'Canceled drag did not restore both sides'
+
+    send('LEFTMOUSE', 'PRESS', (2, 1), ctrl=False)
+    yield
+    send('MOUSEMOVE', 'NOTHING', (2, 1.6), ctrl=False)
+    yield
+    send('LEFTMOUSE', 'RELEASE', (2, 1.6), ctrl=False)
+    yield
+    moved_height = height(2)
+    assert moved_height > 1.5 and abs(height(-2) - moved_height) < 1e-5, 'Drag did not commit both sides'
+    undo()
+    yield
+    assert all(abs(height(x) - start) < 1e-5 for x in (-2, 2)), 'Undo did not restore both sides'
+    undo(redo=True)
+    yield
+    assert all(abs(height(x) - moved_height) < 1e-5 for x in (-2, 2)), 'Redo did not move both sides'
+    undo()
+    yield
+
+    settings.x_symmetry = False
+    send('LEFTMOUSE', 'PRESS', (-2, 1), ctrl=False)
+    yield
+    send('MOUSEMOVE', 'NOTHING', (-2, 1.7), ctrl=False)
+    yield
+    send('LEFTMOUSE', 'RELEASE', (-2, 1.7), ctrl=False)
+    yield
+    left_height = height(-2)
+    assert left_height > 1.6 and abs(height(2) - start) < 1e-5, 'Symmetry-off drag changed both sides'
+    assert addon.topology.last_edit_side(geometry()) == -1, 'Drag did not record the left side'
+    with bpy.context.temp_override(area=area, region=region):
+        assert bpy.ops.mesh.retopo_tool_resymmetrize('INVOKE_DEFAULT', True, source='LAST') == {'FINISHED'}
+    yield
+    assert all(abs(height(x) - left_height) < 1e-5 for x in (-2, 2)), 'Resymmetrize did not use the left side'
+    undo()
+    yield
+    assert abs(height(2) - start) < 1e-5 and abs(height(-2) - left_height) < 1e-5, 'Resymmetrize undo failed'
+    undo(redo=True)
+    yield
+    assert abs(height(2) - left_height) < 1e-5, 'Resymmetrize redo failed'
+    undo()
+    yield
+    undo()
+    yield
+    assert addon.topology.last_edit_side(geometry()) == 1, 'Undo did not restore the previous source side'
+
+    with bpy.context.temp_override(area=area, region=region):
+        settings.symmetry_axis = 'Y'
+        assert tuple(settings.symmetry_axes) == (False, True, False), 'Legacy axis was not restored'
+        settings.symmetry_axes = (False, True, False)
+        bm = geometry()
+        bm.clear()
+        bm.verts.new((1, 1, 0))
+        bm.verts.new((1, -1, 0))
+        addon.sync(bpy.context.edit_object)
+        bpy.ops.ed.undo_push(message='Y symmetry baseline')
+    yield
+    send('LEFTMOUSE', 'PRESS', (1, 1), ctrl=False)
+    yield
+    send('MOUSEMOVE', 'NOTHING', (2, 1), ctrl=False)
+    yield
+    send('LEFTMOUSE', 'RELEASE', (2, 1), ctrl=False)
+    yield
+    assert addon.topology.last_edit_side(geometry(), 1) == 1, 'Y edit used the wrong source axis'
+    with bpy.context.temp_override(area=area, region=region):
+        assert bpy.ops.mesh.retopo_tool_resymmetrize('INVOKE_DEFAULT', True, source='LAST', axis='Y') == {'FINISHED'}
+    yield
+    assert all(abs(v.co.x - 2) < 0.08 for v in geometry().verts), 'Resymmetrize missed the Y counterpart'
+
+    settings.x_symmetry = True
+    settings.snap_to_center = True
+    settings.center_distance = 0.15
+    send('LEFTMOUSE', 'PRESS', (2, 1), ctrl=False)
+    yield
+    send('MOUSEMOVE', 'NOTHING', (2, 0.06), ctrl=False)
+    yield
+    assert len(geometry().verts) == 2 and all(v.co.y == 0 for v in geometry().verts), 'Drag did not snap to Y = 0'
+    send('LEFTMOUSE', 'RELEASE', (2, 0.06), ctrl=False)
+    yield
+    assert len(geometry().verts) == 1 and next(iter(geometry().verts)).co.y == 0, 'Snap did not weld the Y pair'
+    undo()
+    yield
+    assert len(geometry().verts) == 2 and all(abs(v.co.y) > 0.9 for v in geometry().verts), 'Center weld undo failed'
+    undo(redo=True)
+    yield
+    assert len(geometry().verts) == 1 and next(iter(geometry().verts)).co.y == 0, 'Center weld redo failed'
+
+    with bpy.context.temp_override(area=area, region=region):
+        settings.symmetry_axes = (True, True, True)
+        settings.x_symmetry = True
+        settings.snap_to_center = False
+        assert addon.symmetry_options(bpy.context).axes == (0, 1, 2), 'Axis toggles were not independent'
+        bm = geometry()
+        bm.clear()
+        bm.faces.new([bm.verts.new(co) for co in ((1, 1, 1), (2, 1, 1), (1, 2, 1))])
+        bm.verts.new((-3, -3, -3))
+        addon.topology.record_edit_sides(bm, (1, 1, 1))
+        addon.sync(bpy.context.edit_object)
+        bpy.ops.ed.undo_push(message='XYZ resymmetrize baseline')
+        assert bpy.ops.mesh.retopo_tool_resymmetrize('INVOKE_DEFAULT', True, axis='CURRENT') == {'FINISHED'}
+    yield
+    assert addon.mesh_counts(geometry()) == (24, 24, 8), 'Resymmetrize missed enabled axes'
+    assert len({addon.topology.coordinate_sides(v.co) for v in geometry().verts}) == 8, 'Resymmetrize missed octants'
+    undo()
+    yield
+    assert addon.mesh_counts(geometry()) == (4, 3, 1), 'XYZ Resymmetrize must undo in one step'
+    undo(redo=True)
+    yield
+    assert addon.mesh_counts(geometry()) == (24, 24, 8), 'XYZ Resymmetrize redo failed'
+
 
 steps = scenario()
 step = 0
@@ -367,14 +576,20 @@ def tick():
         report.write_text(json.dumps({'status': 'passed', 'version': bpy.app.version_string,
             'checks': ['pending triangle', 'repeated Draw clicks', 'triangle undo/redo',
                        'stable strip rows', 'backtracking', 'preview matches commit',
-                       'strip undo/redo', 'consistent normals', 'cancel', 'no built-in symmetry controls', 'versioned panel title',
+                       'strip undo/redo', 'consistent normals', 'cancel', 'symmetry defaults', 'versioned panel title',
                        'Retopology View default', 'vertex movement stays local',
                        'edge movement stays local', 'movement undo/redo',
                        'Alt hover knife preview without reselection', 'Alt-drag loop cut',
                        'stable loop source', 'mouse-controlled loop sliding', 'loop preview matches commit', 'loop undo/redo',
                        'loop cancel', 'Ctrl-drag no longer cuts loops',
                        'Alt-click knife insertion', 'chained knife cut', 'knife undo/redo',
-                       'stable Ctrl border reselection without topology edits', 'Auto Reselect toggle']}))
+                       'stable Ctrl border reselection without topology edits', 'Auto Reselect toggle',
+                       'Ctrl reselects single/multiple vertices', 'Ctrl-click does not cut',
+                       'Shift-F strength increase/decrease/confirm/cancel', 'F still adjusts radius',
+                       'mirrored Draw and drag', 'mirrored drag undo/redo', 'cancel restores both sides',
+                       'Resymmetrize from last edit', 'Resymmetrize undo/redo', 'source side follows undo',
+                       'Y resymmetrize', 'Y center snap and weld', 'center weld undo/redo',
+                       'XYZ uses all enabled axes', 'XYZ resymmetrize undo/redo']}))
     except Exception:
         report.write_text(json.dumps({'status': 'failed', 'step': step,
                                       'vertices': [tuple(v.co) for v in geometry().verts],

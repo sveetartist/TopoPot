@@ -8,6 +8,300 @@ from mathutils.kdtree import KDTree
 PENDING = "retopo_tool_pending"
 BASE = "retopo_tool_base"
 WINDING_ERROR = "Target edge has incompatible face winding. Flip normals."
+SYMMETRY_EPSILON = 1e-5
+NO_EDIT_SIDES = (0, 0, 0)
+LAST_EDIT_SIDE = "topopot_last_edit_side"
+SYMMETRY_MATCH_ERROR = "The edited topology has no symmetry match. Use Resymmetrize first."
+SYMMETRY_CROSSING_ERROR = "This edit overlaps the symmetry plane. Use Resymmetrize to create a center seam."
+
+
+def mirrored_coordinate(co, axis=0):
+    reflected = co.copy()
+    reflected[axis] *= -1
+    return reflected
+
+
+def plane_side(value):
+    return 1 if value > SYMMETRY_EPSILON else -1 if value < -SYMMETRY_EPSILON else 0
+
+
+def coordinate_sides(co):
+    return tuple(plane_side(value) for value in co)
+
+
+def preferred_sides(*choices):
+    return tuple(next((side for side in axis if side), 0) for axis in zip(*choices))
+
+
+def center_coordinate(co, axis, distance):
+    if 0 < abs(co[axis]) <= distance:
+        co = co.copy()
+        co[axis] = 0
+    return co
+
+
+def center_coordinates(co, axes, distance):
+    if not distance:
+        return co
+    for axis in axes:
+        co = center_coordinate(co, axis, distance)
+    return co
+
+
+def mirror_vertex_indices(coordinates, axis=0):
+    """Pair matching vertices one-to-one, keeping seam vertices shared."""
+    coordinates = list(coordinates.items())
+    positive = [(index, co) for index, co in coordinates if plane_side(co[axis]) == 1]
+    tree = KDTree(len(positive))
+    for index, co in positive:
+        tree.insert(co, index)
+    tree.balance()
+    pairs = {}
+    for index, co in coordinates:
+        side = plane_side(co[axis])
+        if side == 0:
+            pairs[index] = index
+        elif side < 0:
+            candidates = tree.find_range(mirrored_coordinate(co, axis), SYMMETRY_EPSILON)
+            for _, partner, _ in sorted(candidates, key=lambda hit: (hit[2], hit[1])):
+                if partner not in pairs:
+                    pairs[index], pairs[partner] = partner, index
+                    break
+    return pairs
+
+
+def mirrored_positions(positions, pairs, originals, side, axis=0):
+    """Keep center vertices on the seam and apply each pair's movement once."""
+    result = dict(positions)
+    for index, co in positions.items():
+        partner = pairs.get(index)
+        if partner == index:
+            result[index] = center_coordinate(co, axis, float('inf'))
+        elif partner is not None:
+            if partner not in positions or plane_side(originals[index][axis]) == (side or 1):
+                result[partner] = mirrored_coordinate(co, axis)
+    return result
+
+
+def edit_side_state(bm):
+    layer = bm.verts.layers.int.get(LAST_EDIT_SIDE)
+    vertex = next(iter(bm.verts), None) if layer is not None else None
+    return vertex[layer] if vertex is not None else 0
+
+
+def last_edit_side(bm, axis=0):
+    # A signed base-three digit per axis keeps existing X-only values valid.
+    weight = 3 ** axis
+    return ((edit_side_state(bm) + weight // 2) // weight + 1) % 3 - 1
+
+
+def last_edit_sides(bm):
+    state = edit_side_state(bm)
+    return tuple(((state + weight // 2) // weight + 1) % 3 - 1 for weight in (1, 3, 9))
+
+
+def restore_edit_side_state(bm, state):
+    if not len(bm.verts) or edit_side_state(bm) == state:
+        return
+    # Edit-mode undo restores BMesh custom data alongside geometry.
+    layer = bm.verts.layers.int.get(LAST_EDIT_SIDE)
+    if layer is None:
+        layer = bm.verts.layers.int.new(LAST_EDIT_SIDE)
+    next(iter(bm.verts))[layer] = state
+
+
+def record_edit_side(bm, side, axis=0):
+    if side:
+        previous = last_edit_side(bm, axis)
+        restore_edit_side_state(bm, edit_side_state(bm) + (side - previous) * 3 ** axis)
+
+
+def record_edit_sides(bm, sides):
+    if any(sides):
+        merged = preferred_sides(sides, last_edit_sides(bm))
+        restore_edit_side_state(bm, sum(side * weight for side, weight in zip(merged, (1, 3, 9))))
+
+
+def resymmetrize(bm, side, axis=0):
+    if side not in {-1, 1} or not any(plane_side(v.co[axis]) == side for v in bm.verts):
+        raise ValueError("The source side has no vertices away from the symmetry plane")
+    state = edit_side_state(bm)
+    clear_pending(bm)
+    seam = {v for v in bm.verts if plane_side(v.co[axis]) == 0}
+    direction = "XYZ"[axis]
+    bmesh.ops.symmetrize(
+        bm, input=[*bm.verts, *bm.edges, *bm.faces],
+        direction=direction if side > 0 else '-' + direction, dist=SYMMETRY_EPSILON, use_shapekey=True)
+    # Blender welds the cut boundary. Geometry lying entirely in the plane
+    # can be duplicated without a cut, including points and loose edges.
+    originals, duplicates = {}, {}
+    for vertex in bm.verts:
+        if plane_side(vertex.co[axis]) != 0:
+            continue
+        vertex.co[axis] = 0
+        if all(plane_side(edge.other_vert(vertex).co[axis]) == 0 for edge in vertex.link_edges):
+            group = originals if vertex in seam else duplicates
+            group.setdefault(tuple(vertex.co), []).append(vertex)
+    weld = {duplicate: original for key, verts in originals.items()
+            for duplicate, original in zip(duplicates.get(key, ()), verts)}
+    if weld:
+        bmesh.ops.weld_verts(bm, targetmap=weld)
+    restore_edit_side_state(bm, state)
+    record_edit_side(bm, side, axis)
+
+
+def resymmetrize_axes(bm, sources):
+    """Rebuild the enabled halves from the region common to the source sides."""
+    for axis, side in sources.items():
+        available = {plane_side(v.co[axis]) for v in bm.verts} - {0}
+        if available:
+            if side not in available:
+                raise ValueError(f"The source sides have no shared geometry on {'XYZ'[axis]}. Choose another source side.")
+            resymmetrize(bm, side, axis)
+
+
+def snap_new_vertices(bm, previous, axes, distance):
+    moved = []
+    for vertex in bm.verts:
+        if vertex not in previous:
+            snapped = center_coordinates(vertex.co, axes, distance)
+            if snapped != vertex.co:
+                vertex.co = snapped
+                moved.append(vertex)
+    if (any(edge.calc_length() <= SYMMETRY_EPSILON for v in moved for edge in v.link_edges)
+            or any(face.calc_area() <= SYMMETRY_EPSILON ** 2 for v in moved for face in v.link_faces)):
+        raise ValueError("Snap to Center would collapse the edited geometry")
+
+
+def _element_keys(bm, indices):
+    edges = {tuple(sorted(indices[v] for v in edge.verts)): edge for edge in bm.edges}
+    faces = {tuple(sorted(indices[v] for v in face.verts)): face for face in bm.faces}
+    return edges, faces
+
+
+def _mirror_key(key, pairs):
+    try:
+        return tuple(sorted(pairs[index] for index in key))
+    except KeyError:
+        raise ValueError(SYMMETRY_MATCH_ERROR) from None
+
+
+def mirror_edit(bm, edit, pairs=None, side=0, axis=0):
+    """Apply a topology edit and reflect its changes, keeping existing opposite-side data."""
+    before = {v: i for i, v in enumerate(bm.verts)}
+    coordinates = {i: v.co.copy() for v, i in before.items()}
+    pairs = mirror_vertex_indices(coordinates, axis) if pairs is None else dict(pairs)
+    old_edges, old_faces = _element_keys(bm, before)
+
+    result = edit()
+    indices, new_verts = {}, {}
+    new_index = len(before)
+    for vertex in bm.verts:
+        index = before.get(vertex)
+        if index is None:
+            index = new_index
+            new_index += 1
+            new_verts[index] = vertex
+        indices[vertex] = index
+    edges, faces = _element_keys(bm, indices)
+    vertices = {index: vertex for vertex, index in indices.items()}
+    removed = coordinates.keys() - vertices.keys()
+    changed = {i for i in coordinates.keys() & vertices.keys() if coordinates[i] != vertices[i].co}
+    if not (new_verts or removed or changed or edges.keys() != old_edges.keys() or faces.keys() != old_faces.keys()):
+        return result
+
+    pairs.update(mirror_vertex_indices({i: v.co for i, v in new_verts.items()}, axis))
+    clones = {}
+    for index, vertex in new_verts.items():
+        if index not in pairs:
+            pairs[index], pairs[new_index] = new_index, index
+            clones[new_index] = vertex
+            new_index += 1
+        elif pairs[index] == index:
+            vertex.co[axis] = 0
+
+    def reflected_changes(original, current, faces=False):
+        delete, add = set(), {}
+        for key in original.keys() - current.keys():
+            partner = _mirror_key(key, pairs)
+            if partner not in original:
+                raise ValueError(SYMMETRY_MATCH_ERROR)
+            if partner in current:
+                delete.add(current[partner])
+        sides = set()
+        for key in current.keys() - original.keys():
+            partner = _mirror_key(key, pairs)
+            half = {plane_side(vertices[i].co[axis]) for i in key} - {0}
+            if len(half) == 1:
+                sides.update(half)
+            if partner not in current:
+                if half == {-1, 1}:
+                    raise ValueError(SYMMETRY_CROSSING_ERROR)
+                add[partner] = current[key]
+        if faces and add and sides == {-1, 1}:
+            raise ValueError(SYMMETRY_CROSSING_ERROR)
+        return delete, add
+
+    deleted_faces, added_faces = reflected_changes(old_faces, faces, faces=True)
+    deleted_edges, added_edges = reflected_changes(old_edges, edges)
+    deleted_verts = {vertices[partner] for i in removed
+                     for partner in _mirror_key((i,), pairs) if partner in vertices}
+    if (any(face not in deleted_faces for edge in deleted_edges for face in edge.link_faces)
+            or any(edge not in deleted_edges for vertex in deleted_verts for edge in vertex.link_edges)
+            or any(vertices.get(i) in deleted_verts for key in (*added_edges, *added_faces) for i in key)):
+        raise ValueError(SYMMETRY_CROSSING_ERROR)
+
+    for index in changed:
+        partner = _mirror_key((index,), pairs)[0]
+        if partner == index:
+            vertices[index].co[axis] = 0
+        elif partner not in changed or plane_side(coordinates[index][axis]) == side:
+            if partner in vertices and vertices[partner] not in deleted_verts:
+                vertices[partner].co = mirrored_coordinate(vertices[index].co, axis)
+
+    for face in deleted_faces:
+        bm.faces.remove(face)
+    for edge in deleted_edges:
+        bm.edges.remove(edge)
+    for vertex in deleted_verts:
+        bm.verts.remove(vertex)
+    for index, template in clones.items():
+        vertex = bm.verts.new(mirrored_coordinate(template.co, axis), template)
+        vertex.select = False
+        for layer in bm.verts.layers.shape.values():
+            vertex[layer] = mirrored_coordinate(template[layer], axis)
+        vertices[index] = vertex
+    for key, template in added_edges.items():
+        edge = bm.edges.new(tuple(vertices[i] for i in key), template)
+        edge.select = False
+        edge.seam, edge.smooth = template.seam, template.smooth
+    for template in added_faces.values():
+        opposite = [vertices[pairs[indices[v]]] for v in reversed(list(template.verts))]
+        face = bm.faces.new(opposite, template)
+        face.select = False
+        face.smooth, face.material_index = template.smooth, template.material_index
+        corners = {vertices[pairs[indices[loop.vert]]]: loop for loop in template.loops}
+        for loop in face.loops:
+            loop.copy_from(corners[loop.vert])
+        if template.hide:
+            face.hide_set(True)
+    for key, template in added_edges.items():
+        if template.hide:
+            bm.edges.get(tuple(vertices[i] for i in key)).hide_set(True)
+    for index, template in clones.items():
+        if template.hide:
+            vertices[index].hide_set(True)
+    for items, layer_name in ((bm.edges, BASE), (bm.faces, PENDING)):
+        layer = items.layers.int.get(layer_name)
+        if layer is not None:
+            for item in list(items):
+                if item[layer] and all(v in indices and indices[v] in pairs for v in item.verts):
+                    opposite = [vertices.get(pairs[indices[v]]) for v in item.verts]
+                    if all(v is not None and v.is_valid for v in opposite):
+                        partner = items.get(opposite)
+                        if partner is not None:
+                            partner[layer] = 1
+    return result
 
 
 def boundary_loops(bm):
@@ -78,7 +372,7 @@ def _rim_normal(vertices):
                 for a, b in zip(vertices, vertices[1:] + vertices[:1])), Vector())
 
 
-def _grid_faces(bm, vertices, edges, material, smooth, balanced=False):
+def _grid_faces(bm, vertices, edges, material, smooth, balanced=False, originals=None):
     count = len(vertices)
     # Pick four corners with opposite sides of equal length. Prefer sharp rim
     # corners, which gives rectangular holes a regular grid instead of a fan.
@@ -93,7 +387,8 @@ def _grid_faces(bm, vertices, edges, material, smooth, balanced=False):
                         key=lambda pair: (round(sum(turns[(pair[0] + step) % count]
                                                     for step in (0, pair[1], half, half + pair[1])), 4),
                                           -abs(pair[1] - count / 4), -pair[0]), reverse=True)
-    originals = set(bm.verts), set(bm.edges), set(bm.faces)
+    if originals is None:
+        originals = set(bm.verts), set(bm.edges), set(bm.faces)
     seen, layouts, first_error = set(), 0, None
     for offset, span in candidates:
         corners = tuple(sorted((offset + step) % count for step in (0, span, half, half + span)))
@@ -130,6 +425,23 @@ def _remove_fill(bm, originals):
             bm.verts.remove(vertex)
 
 
+def remove_preview_fill(bm, faces, originals):
+    """Restore a shared preview BMesh, including any unused generated geometry."""
+    original_verts, original_edges, original_faces = originals
+    edges = {edge for face in faces for edge in face.edges if edge not in original_edges}
+    verts = {vertex for face in faces for vertex in face.verts if vertex not in original_verts}
+    for face in faces:
+        bm.faces.remove(face)
+    for edge in edges:
+        if not edge.link_faces:
+            bm.edges.remove(edge)
+    for vertex in verts:
+        if not vertex.link_edges:
+            bm.verts.remove(vertex)
+    if (len(bm.verts), len(bm.edges), len(bm.faces)) != tuple(map(len, originals)):
+        _remove_fill(bm, originals)
+
+
 def _validate_fill(bm, vertices, faces):
     """Reject folds and grid layouts which extend beyond a concave rim."""
     if not faces or any(len(f.verts) not in {3, 4} for f in faces):
@@ -146,6 +458,14 @@ def _validate_fill(bm, vertices, faces):
     def cross(a, b):
         return a.x * b.y - a.y * b.x
     polygon = [projected(v) for v in vertices]
+    for i, (a, b) in enumerate(zip(polygon, polygon[1:] + polygon[:1])):
+        for j in range(i + 2, len(polygon)):
+            if i == 0 and j == len(polygon) - 1:
+                continue
+            c, d = polygon[j], polygon[(j + 1) % len(polygon)]
+            if (cross(b - a, c - a) * cross(b - a, d - a) < -1e-14
+                    and cross(d - c, a - c) * cross(d - c, b - c) < -1e-14):
+                raise ValueError("The boundary intersects or folds in its local projection")
     area = abs(sum(cross(a, b) for a, b in zip(polygon, polygon[1:] + polygon[:1])))
     if area < 1e-10:
         raise ValueError("The hole is too narrow or degenerate")
@@ -199,7 +519,7 @@ def _face_quality(vertices, coords, orientation, indices):
     return sum(lengths) / sum(turns)
 
 
-def _quad_dominant_layout(bm, vertices):
+def _quad_dominant_layout(bm, vertices, balance_areas=False):
     """Search polygon partitions, minimizing triangles before optimizing shape.
 
     Unlike joining a fixed triangulation, this can change diagonals to avoid
@@ -209,6 +529,8 @@ def _quad_dominant_layout(bm, vertices):
     if count > 48:
         return None
     coords, orientation = _fill_coordinates(vertices)
+    area = abs(sum(a[0]*b[1] - a[1]*b[0] for a, b in zip(coords, coords[1:] + coords[:1]))) / 2
+    target_area = area / max(1, (count-1)//2)
     scale = max((b[0] - a[0]) ** 2 + (b[1] - a[1]) ** 2
                 for a, b in zip(coords, coords[1:] + coords[:1]))
     epsilon = max(scale * 1e-8, 1e-12)
@@ -260,6 +582,11 @@ def _quad_dominant_layout(bm, vertices):
                 quality = _face_quality(vertices, coords, orientation, indices)
                 if quality is None:
                     return
+                if balance_areas:
+                    points = [coords[index] for index in indices]
+                    face_area = abs(sum(a[0]*b[1] - a[1]*b[0]
+                                        for a, b in zip(points, points[1:] + points[:1]))) / 2
+                    quality = 3 * quality + (face_area / max(target_area, 1e-16) - 1) ** 2
                 score = (int(len(indices) == 3) + sum(plans[child][0][0] for child in children),
                          quality + sum(plans[child][0][1] for child in children))
                 if best is None or score < best[0]:
@@ -541,7 +868,7 @@ def _square_grid_faces(bm, vertices, edges, material, smooth):
         return None
 
 
-def _square_shaped(faces):
+def _square_shaped(faces, edge_ratio=1.5, corner_cosine=0.5):
     """Keep an existing regular grid only when its cells are close to squares."""
     for face in faces:
         if len(face.verts) != 4:
@@ -549,9 +876,9 @@ def _square_shaped(faces):
         corners = list(face.verts)
         directions = [b.co - a.co for a, b in zip(corners, corners[1:] + corners[:1])]
         lengths = [delta.length for delta in directions]
-        if min(lengths) < 1e-8 or max(lengths) > min(lengths) * 1.5:
+        if min(lengths) < 1e-8 or max(lengths) > min(lengths) * edge_ratio:
             return False
-        if any(abs(a.normalized().dot(b.normalized())) > 0.5
+        if any(abs(a.normalized().dot(b.normalized())) > corner_cosine
                for a, b in zip(directions, directions[1:] + directions[:1])):
             return False
     return True
@@ -589,7 +916,7 @@ def _mixed_faces(bm, vertices, edges, material, smooth):
                 return faces
             except (ValueError, RuntimeError):
                 _remove_fill(bm, originals)
-    layout = _quad_dominant_layout(bm, vertices)
+    layout = _quad_dominant_layout(bm, vertices, balance_areas=True)
     if layout is not None:
         faces = [bm.faces.new(corners) for corners in layout]
         for face in faces:
@@ -608,7 +935,129 @@ def _mixed_faces(bm, vertices, edges, material, smooth):
     return faces
 
 
-def fill_hole(bm, vertices, project=None, quad_only=False):
+
+
+
+
+
+
+def _equalize_fill_areas(bm, rim, faces, project=None):
+    """Fit square quads/equilateral triangles of equal area with a fixed rim."""
+    boundary = set(rim)
+    movable = {v for f in faces for v in f.verts if v not in boundary}
+    if not movable or len(faces) < 2:
+        return
+    target = sum(f.calc_area() for f in faces) / len(faces)
+    if target < 1e-16:
+        return
+    anchors = {v: v.co.copy() for v in movable}
+    poor = set(_poor_quads(faces))
+    regular = [f for f in faces if len(f.verts) == 4 and all(v in movable for v in f.verts)
+               and _square_shaped([f], 1.25, 0.26)]
+    terms = {}
+    for face in faces:
+        corners = list(face.verts)
+        size = sqrt(target) if len(corners) == 4 else sqrt(4*target/sqrt(3))
+        pairs = [(a, b, size) for a, b in zip(corners, corners[1:] + corners[:1])]
+        if len(corners) == 4:
+            pairs += [(corners[0], corners[2], size*sqrt(2)),
+                      (corners[1], corners[3], size*sqrt(2))]
+        terms[face] = pairs
+
+    def energy():
+        variance = sum((f.calc_area() / target - 1) ** 2 for f in faces) / len(faces)
+        shape = sum(sum(((a.co-b.co).length/size-1)**2 for a, b, size in pairs)/len(pairs)
+                    for pairs in terms.values()) / len(faces)
+        drift = sum((v.co-anchors[v]).length_squared for v in movable) / (len(movable)*target)
+        return variance + 12*shape + 0.01*drift
+
+    for _ in range(16):
+        gradients = {v: Vector() for v in movable}
+        weights = {v: 0.0 for v in movable}
+        for face in faces:
+            corners = list(face.verts)
+            normal = _rim_normal(corners).normalized()
+            residual = face.calc_area() / target - 1
+            for i, v in enumerate(corners):
+                if v in movable:
+                    gradient = (corners[(i+1) % len(corners)].co - corners[i-1].co).cross(normal) * 0.5
+                    gradients[v] += gradient * residual
+                    weights[v] += gradient.length_squared / target
+            pairs = terms[face]
+            for a, b, size in pairs:
+                delta = a.co-b.co
+                length = max(delta.length, size*1e-8)
+                gradient = delta * (12*target*(length/size-1)/(size*length*len(pairs)))
+                weight = 12*target/(size*size*len(pairs))
+                if a in movable:
+                    gradients[a] += gradient
+                    weights[a] += weight
+                if b in movable:
+                    gradients[b] -= gradient
+                    weights[b] += weight
+        positions = {v: v.co.copy() for v in movable}
+        deltas = {}
+        for v in movable:
+            delta = -gradients[v] / max(weights[v], 1e-12)
+            limit = sqrt(target)*0.2
+            if delta.length > limit:
+                delta *= limit/delta.length
+            deltas[v] = delta
+        old_energy = energy()
+        accepted = False
+        for attempt in range(7):
+            for v in movable:
+                co = positions[v] + deltas[v] * (0.5 ** attempt)
+                v.co = project(co) if project is not None else co
+            if (energy() < old_energy - 1e-9 and not (set(_poor_quads(faces)) - poor)
+                    and _square_shaped(regular, 1.25, 0.26)):
+                try:
+                    _validate_fill(bm, rim, faces)
+                    accepted = True
+                    break
+                except ValueError:
+                    pass
+        if not accepted:
+            for v, co in positions.items():
+                v.co = co
+            break
+
+
+def _orient_fill_faces(bm, faces, edges):
+    """Make the fill internally consistent before matching the surrounding rim."""
+    rim = set(edges)
+    fill = set(faces)
+    # A wire rim has no surrounding winding to decide which way is outward.
+    if not any(len(edge.link_faces) == 2 for edge in edges):
+        bmesh.ops.recalc_face_normals(bm, faces=faces)
+        return
+    flip = {faces[0]: False}
+    pending = [faces[0]]
+    while pending:
+        face = pending.pop()
+        for loop in face.loops:
+            other = loop.link_loop_radial_next
+            if other == loop or loop.edge in rim:
+                continue
+            if other.face not in fill:
+                bmesh.ops.recalc_face_normals(bm, faces=faces)
+                return
+            reverse = flip[face] != (loop.vert == other.vert)
+            if other.face not in flip:
+                flip[other.face] = reverse
+                pending.append(other.face)
+            elif flip[other.face] != reverse:
+                raise ValueError("The fill has inconsistent winding")
+    if len(flip) != len(faces):
+        bmesh.ops.recalc_face_normals(bm, faces=faces)
+        return
+    for face, reverse in flip.items():
+        if reverse:
+            face.normal_flip()
+        face.normal_update()
+
+
+def fill_hole(bm, vertices, project=None, quad_only=False, *, finalize=True, originals=None):
     """Prefer a grid, falling back to quads/triangles for irregular and odd rims."""
     count = len(vertices)
     if count < 3:
@@ -620,21 +1069,22 @@ def fill_hole(bm, vertices, project=None, quad_only=False):
     edges = [bm.edges.get((a, b)) for a, b in zip(vertices, vertices[1:] + vertices[:1])]
     if any(e is None or e.hide or len(e.link_faces) > 1 or any(f.hide for f in e.link_faces) for e in edges):
         raise ValueError("Choose a closed boundary loop")
-    originals = set(bm.verts), set(bm.edges), set(bm.faces)
+    if originals is None:
+        originals = set(bm.verts), set(bm.edges), set(bm.faces)
     original_verts, _, original_faces = originals
     reference_face = next((e.link_faces[0] for e in edges if e.link_faces), None)
     material = reference_face.material_index if reference_face is not None else 0
     smooth = reference_face.smooth if reference_face is not None else False
     try:
         faces = None
-        if count >= 4 and not count % 2:
+        if faces is None and count >= 4 and not count % 2:
             try:
-                faces = _grid_faces(bm, vertices, edges, material, smooth)
+                faces = _grid_faces(bm, vertices, edges, material, smooth, originals=originals)
                 if any(len(f.verts) != 4 for f in faces):
                     raise ValueError("This hole cannot form a quad grid")
-                _validate_fill(bm, vertices, faces)
                 if not quad_only:
-                    if not _square_shaped(faces):
+                    areas = [face.calc_area() for face in faces]
+                    if not _square_shaped(faces) or max(areas) > min(areas) * 2:
                         raise ValueError("Prefer square interior cells with a boundary transition")
                     poor_quads = _poor_quads(faces)
                     if poor_quads:
@@ -658,7 +1108,7 @@ def fill_hole(bm, vertices, project=None, quad_only=False):
             faces = _mixed_faces(bm, vertices, edges, material, smooth)
             _validate_fill(bm, vertices, faces)
         face_set = set(faces)
-        bmesh.ops.recalc_face_normals(bm, faces=faces)
+        _orient_fill_faces(bm, faces, edges)
         conflicts = []
         for edge in edges:
             added = next((f for f in edge.link_faces if f in face_set), None)
@@ -675,20 +1125,25 @@ def fill_hole(bm, vertices, project=None, quad_only=False):
         elif any(conflicts):
             raise ValueError("The hole has inconsistent winding. Flip normals first.")
         if project is not None:
-            for vertex in bm.verts:
-                if vertex not in original_verts:
-                    vertex.co = project(vertex.co)
+            added = {v for face in faces for v in face.verts if v not in original_verts}
+            for vertex in added:
+                vertex.co = project(vertex.co)
+        if not quad_only:
+            _equalize_fill_areas(bm, vertices, faces, project)
+            if finalize:
+                bm.normal_update()
         _validate_fill(bm, vertices, faces)
         if any(len(e.link_faces) > 2 for f in faces for e in f.edges):
             raise ValueError("Fill Hole would create non-manifold geometry")
     except Exception:
         _remove_fill(bm, originals)
         raise
-    clear_pending(bm)
-    select(bm, None)
-    for face in faces:
-        face.select_set(True)
-    bm.select_history.add(faces[-1])
+    if finalize:
+        clear_pending(bm)
+        select(bm, None)
+        for face in faces:
+            face.select_set(True)
+        bm.select_history.add(faces[-1])
     return faces
 
 
@@ -1097,15 +1552,13 @@ def _snap_strip_quad(bm, face, original, snap_distance=None, project=None, targe
         for _, _, candidate, co in sorted(candidates, key=lambda item: item[:2]):
             old_corner = corner.co.copy()
             old_other = other.co.copy()
-            span_vec = old_other - old_corner
             other_trials = [old_other]
-            if other not in original and span_vec.length > 1e-8:
-                span_dir = span_vec.normalized()
-                old_w = span_vec.length
-                new_w = (old_other - co).dot(span_dir)
-                if new_w < old_w:
-                    shifted = old_other + span_dir * (old_w - new_w)
-                    other_trials.insert(0, project(shifted) if project is not None else shifted)
+            if other not in original:
+                # Follow the neighboring row with the entire free edge. Moving
+                # only the welded corner leaves the far side at the cursor and
+                # can flare or shear the quad, especially on uneven boundaries.
+                shifted = old_other + co - old_corner
+                other_trials.insert(0, project(shifted) if project is not None else shifted)
             corner.co = co
             proposed = [candidate if v == corner else v for v in corners]
             welded = False
@@ -1156,6 +1609,60 @@ def _snap_strip_quad(bm, face, original, snap_distance=None, project=None, targe
     return face, bm.edges.get((corners[2], corners[3]))
 
 
+def _strip_boundary_row(edge, points, start, original, snap_distance, target):
+    """Replace width-sized samples with rows of an attached longer boundary."""
+    if snap_distance is None:
+        return points[start], start + 1
+    center = sum((v.co for v in edge.verts), Vector()) * 0.5
+    direction = points[start] - center
+    if direction.length < 1e-8:
+        return points[start], start + 1
+    a, b = oriented(edge, points[start])
+    width = edge.calc_length()
+    choices = []
+    for base in (a, b):
+        if base not in original:
+            continue
+        for side in base.link_edges:
+            candidate = side.other_vert(base)
+            if (side == edge or side.hide or len(side.link_faces) > 1
+                    or candidate not in original or candidate.hide
+                    or (target is not None and candidate in target.verts)):
+                continue
+            delta = candidate.co - base.co
+            length = delta.length
+            if length <= width * 1.75 or delta.normalized().dot(direction.normalized()) < 0.75:
+                continue
+            if side.link_faces:
+                loop = next(l for l in side.link_faces[0].loops if l.edge == side)
+                if loop.vert != (base if base == a else candidate):
+                    continue
+            choices.append((length, delta))
+    for length, delta in sorted(choices, key=lambda item: item[0]):
+        tangent = delta / length
+        corridor = max(width * 0.75, snap_distance(center + delta))
+        previous = center
+        for index in range(start, len(points)):
+            point = points[index]
+            advance = (point - center).dot(tangent)
+            if advance >= length - 1e-6:
+                before = (previous - center).dot(tangent)
+                crossing = previous.lerp(point, (length - before) / max(advance - before, 1e-8))
+                if (crossing - (center + delta)).length > corridor:
+                    break
+                # Retain a sample beyond this row for the next boundary edge.
+                next_index = index + 1 if (point - crossing).length < width * 0.6 else index
+                return center + delta, next_index
+            if ((point - center) - tangent * advance).length > corridor:
+                break
+            previous = point
+        else:
+            # The cursor has not reached the next boundary vertex yet. Keep a
+            # single moving tip instead of filling that interval with tiny quads.
+            return points[-1], len(points)
+    return points[start], start + 1
+
+
 def quad_strip(bm, anchor, points, project=None, target=None, snap_distance=None, snapped_points=None,
                triangle=False):
     """Extrude a whole stroke, rolling back geometry if any quad is invalid."""
@@ -1174,9 +1681,11 @@ def quad_strip(bm, anchor, points, project=None, target=None, snap_distance=None
             face = extend(bm, anchor, bm.verts.new(project(points[0]) if project else points[0]))
             faces.append(face)
             return faces
-        for point in points:
+        sample = 0
+        while sample < len(points):
             if edge is None or len(edge.link_faces) > 1:
                 break
+            point, sample = _strip_boundary_row(edge, points, sample, original, snap_distance, target)
             face = extrude_quad(bm, edge, point, project=project, finalize=False)
             face, edge = _snap_strip_quad(bm, face, original, snap_distance, project, target,
                                           snapped_points, weld_targets)
@@ -1445,16 +1954,16 @@ def snap_quad(bm, face, original, snap_distance, snapped_points=None):
     return face
 
 
-def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, project=None, quad_only=False, snap_distance=None, snapped_points=None, auto_reselect=True):
+def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, project=None, quad_only=False, snap_distance=None, snapped_points=None, auto_reselect=True, allow_cut=True):
     original = set(bm.verts)
-    result = _apply_click(bm, anchor, hit, point, edge_factor, bridge_mode, quad_only, auto_reselect)
+    result = _apply_click(bm, anchor, hit, point, edge_factor, bridge_mode, quad_only, auto_reselect, allow_cut)
     if project is not None:
         positions = [(v, project(v.co)) for v in bm.verts if v not in original]
         for vertex, position in positions:
             vertex.co = position
     if quad_only and snap_distance is not None and isinstance(result, bmesh.types.BMFace):
         result = snap_quad(bm, result, original, snap_distance, snapped_points)
-    elif isinstance(anchor, bmesh.types.BMVert) and isinstance(result, bmesh.types.BMEdge) and snap_distance is not None:
+    elif allow_cut and isinstance(anchor, bmesh.types.BMVert) and isinstance(result, bmesh.types.BMEdge) and snap_distance is not None:
         new_vert = next((v for v in result.verts if v not in original), None)
         if new_vert is not None:
             radius = snap_distance(new_vert.co) * 0.25
@@ -1469,9 +1978,16 @@ def apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False,
     return result
 
 
-def _apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, quad_only=False, auto_reselect=True):
+def _apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False, quad_only=False, auto_reselect=True, allow_cut=True):
     if auto_reselect and hit is None and point is not None and not bridge_mode:
         anchor = hover_select_edge(bm, anchor, point)
+    if not allow_cut:
+        if isinstance(hit, bmesh.types.BMEdge) and (anchor == hit or not isinstance(anchor, bmesh.types.BMEdge)):
+            clear_pending(bm)
+            select(bm, hit)
+            return hit
+        if isinstance(anchor, bmesh.types.BMVert) and isinstance(hit, bmesh.types.BMVert):
+            raise ValueError("Select a starting edge to draw; use Alt to cut")
     if isinstance(hit, bmesh.types.BMEdge):
         if bridge_mode or (isinstance(anchor, bmesh.types.BMEdge) and anchor != hit):
             if not isinstance(anchor, bmesh.types.BMEdge):
@@ -1496,6 +2012,58 @@ def _apply_click(bm, anchor, hit, point=None, edge_factor=0.5, bridge_mode=False
     if quad_only and isinstance(anchor, bmesh.types.BMEdge) and not pending(bm, anchor):
         return extrude_quad(bm, anchor, hit.co if hit is not None else point, target=hit)
     return extend(bm, anchor, hit if hit is not None else bm.verts.new(point), quad_only)
+
+
+def edge_merge_map(bm, source, target, positions=None):
+    """Map a whole edge to a topological neighbor, keeping shared corners fixed."""
+    if (source == target or source.hide or target.hide
+            or any(v.hide for e in (source, target) for v in e.verts)
+            or any(f.hide for v in source.verts for f in v.link_faces)
+            or any(len(e.link_faces) > 2 for e in (source, target))):
+        raise ValueError("Choose a different visible neighboring edge")
+    a, b = source.verts
+    c, d = target.verts
+    shared = set(source.verts) & set(target.verts)
+    if not (shared or set(source.link_faces) & set(target.link_faces)
+            or any(bm.edges.get((v, w)) for v in source.verts for w in target.verts)):
+        raise ValueError("Only neighboring edges can merge")
+    if shared:
+        corner = next(iter(shared))
+        return {corner: corner, source.other_vert(corner): target.other_vert(corner)}
+    positions = positions if positions is not None else [a.co, b.co]
+    direct = sum((p-v.co).length_squared for p, v in zip(positions, (c, d)))
+    reverse = sum((p-v.co).length_squared for p, v in zip(positions, (d, c)))
+    return dict(zip((a, b), (c, d) if direct <= reverse else (d, c)))
+
+
+def merge_edges(bm, source, target, positions=None):
+    """Validate the simultaneous weld on a copy before changing live topology."""
+    mapping = edge_merge_map(bm, source, target, positions)
+    bm.verts.index_update()
+    bm.edges.index_update()
+    pairs = [(v.index, w.index) for v, w in mapping.items() if v != w]
+    scratch = bm.copy()
+    try:
+        scratch.verts.ensure_lookup_table()
+        targetmap = {scratch.verts[i]: scratch.verts[j] for i, j in pairs}
+        survivors = list(targetmap.values())
+        bmesh.ops.weld_verts(scratch, targetmap=targetmap)
+        for v in survivors:
+            if not v.is_valid:
+                raise ValueError("Edge merge would remove a target corner")
+            if any(len(e.link_faces) > 2 for e in v.link_edges):
+                raise ValueError("Edge merge would create non-manifold geometry")
+            for face in v.link_faces:
+                check_face(scratch, list(face.verts), replacing=face)
+    finally:
+        scratch.free()
+    endpoints = list(target.verts)
+    clear_pending(bm)
+    bmesh.ops.weld_verts(bm, targetmap={v: w for v, w in mapping.items() if v != w})
+    target = bm.edges.get(endpoints)
+    select(bm, target)
+    bm.normal_update()
+    return target
 
 
 def merge_vertices(bm, source, target, discard_pending=False):
